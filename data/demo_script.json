@@ -1,0 +1,17 @@
+{
+  "about": "The six stage-demo presets, in order. Read by the UI (Demo script menu), `python -m semcache preflight`, scripts/check_demo.py and scripts/screenshots.mjs. 'expect' is what the FAQ profile does after `python -m semcache reset-demo`; 'after' names a preset that must have been answered first (it adds a row to C).",
+  "steps": [
+    {"label": "Exact repeat", "query": "How do I reset my password if I forgot it?", "expect": "hit",
+     "note": "Word for word an FAQ question: a hit before any math is needed."},
+    {"label": "Paraphrase hit", "query": "cheap flight tickets to goa", "expect": "hit",
+     "note": "Different words, same meaning: the SVD finds the FAQ answer."},
+    {"label": "Miss that grows C", "query": "what is the best laptop for students", "expect": "miss",
+     "note": "Nothing close enough: the model answers and C gets a new row."},
+    {"label": "Its paraphrase hits the new row", "query": "best student laptop", "expect": "hit", "after": 3,
+     "note": "Ask after the miss above: it lands on the row that was just added."},
+    {"label": "Follow-up", "query": "and what about for gaming?", "expect": "follow-up",
+     "note": "Depends on the conversation, so it skips the shared cache."},
+    {"label": "Blocked by the guard", "query": "what is the capital of france", "expect": "blocked",
+     "note": "Most of its words are unknown to the model, so only an exact repeat could hit."}
+  ]
+}

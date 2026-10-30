@@ -1,0 +1,114 @@
+# Semantic cache settings. Every key is optional; defaults live in semcache/config.py.
+# After changing anything under [embedder] or [corpus], rebuild:  python -m semcache build --profile NAME
+#
+# Two model profiles, each with its own model, cache, evaluation and metrics in artifacts/<profile>/.
+# Pick one with --profile (build, serve, ask, ...) or the SEMCACHE_PROFILE environment variable.
+# The tables at the end of this file override the base settings for each profile.
+
+[paths]
+artifacts_dir = "artifacts"             # built model, saved cache, evaluation reports
+faq_csv = "data/faq.csv"                # demo FAQ: warms the cache and adds to the corpus
+quora_train = "data/quora/train.csv"    # created by scripts/download_qqp.py
+quora_eval = "data/quora/validation.csv"
+
+[corpus]
+use_faq = true
+use_quora = true                        # only if the Quora file exists
+quora_max_questions = 100000            # how many Quora questions to fit the SVD on
+require_quora = false                   # true: fail the build if the Quora file is missing
+
+[embedder]
+rank = 200                              # k: latent dimensions kept by the truncated SVD
+max_rank_fraction = 0.35                # k is also capped at this share of the corpus size
+ngram_max = 2                           # 1 = words only, 2 = words + bigrams
+min_df = 1                              # ignore single words seen in fewer documents
+min_df_ngram = 2                        # ignore bigrams seen in fewer documents (one-off bigrams are noise)
+max_df_ratio = 1.0
+max_features = 40000                    # vocabulary size cap
+sublinear_tf = true                     # TF -> 1 + ln(TF)
+smooth_idf = true                       # ln((1+N)/(1+df)) + 1
+stem = true                             # fold plurals: flights -> flight
+sigma_power = 1.0                       # 1 = project onto V_k; 0 = pure fold-in coordinates
+oversample = 20                         # randomized SVD: extra sample columns
+power_iters = 7                         # randomized SVD: power iterations
+seed = 42
+use_latent_stopwords = false            # leave the words below out of the SVD fit (they stay in TF-IDF)
+latent_stopwords = ["what", "how", "why", "which", "best", "way", "good", "can", "does"]
+
+[cache]
+threshold = 0.70                        # tau: cosine needed for a hit (re-tune with `evaluate`)
+min_known_ratio = 0.5                   # semantic hits need at least this share of the words to be known
+lsa_weight = 1.0                        # 1 = pure LSA; <1 blends in raw TF-IDF cosine (see `evaluate`)
+min_latent_coverage = 0.30              # rho guard: a pair where either question keeps less than this
+                                        # share of itself in the SVD space is scored by word overlap only
+max_entries = 5000                      # least-recently-used entries are evicted beyond this
+top_k = 5                               # matches shown per lookup
+use_lsh = false                         # approximate search; worth it for large caches
+lsh_bits = 12
+lsh_tables = 8
+lsh_min_entries = 1000                  # below this size, brute force is used anyway
+autosave_every = 10                     # save the cache after this many new entries
+warm_with_faq = true                    # preload FAQ answers when the cache is built or reset
+
+[llm]
+backend = "ollama"                      # "ollama" or "stub"
+fallback_to_stub = true                 # use the stub if Ollama is not running
+ollama_url = "http://localhost:11434"
+model = "auto"                          # "auto" = first model you've pulled, or e.g. "llama3.2:3b"
+temperature = 0.2
+timeout_s = 120
+system_prompt = "Answer clearly and concisely in 2-4 sentences."
+cache_stub_answers = true               # backend = "stub" only: store placeholder answers so the demo
+                                        # shows hits. Fallback answers (Ollama down) are never cached.
+stub_delay_ms = 0                       # simulated latency for the stub; keep 0 for honest numbers
+
+[users]
+# Users pick a name (no passwords). The cache is shared: answers to standalone questions
+# help everyone, while answers added by hand stay private to the person who added them.
+# Admin actions (reset the shared cache, add or delete shared entries) need the passphrase in the
+# SEMCACHE_ADMIN_KEY environment variable, sent as an X-Admin-Key header. Without it they are off.
+detect_follow_ups = true                # follow-ups ("what about the second one?") skip the cache
+history_messages = 8                    # earlier messages of the thread sent to the LLM with a follow-up
+history_chars = 6000
+max_threads_per_user = 100
+max_messages_per_thread = 200
+
+[api]
+cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+[metrics]
+enabled = true                          # events go to artifacts/<profile>/metrics/events.jsonl
+bucket_seconds = 10                     # "Cache performance over time" bucket
+# What-if pricing for "Est. LLM cost" and "Est. savings". Ollama is free locally, so these
+# stay unset here; set them in your local copy for a demo. The cards then show
+# "estimated at <price> per 1K tokens" plus price_note. Example:
+# price_per_1k_input_tokens = 0.00015
+# price_per_1k_output_tokens = 0.0006
+# cost_per_llm_call_usd = 0.0
+# price_note = "assumed: <model> list price"
+
+[eval]
+pairs = "auto"                          # "faq", "quora" or "auto" (Quora when the file exists)
+max_pairs = 20000                       # Quora validation pairs to score
+ranks = [10, 25, 50, 100, 150, 200]     # k values for the rank sweep
+cache_sim_pairs = 5000                  # pairs used in the cache simulation
+latency_sizes = [1000, 5000, 20000, 50000]
+seed = 7
+
+# --------------------------------------------------------------------------- profiles
+[profiles]
+default = "faq"                         # the slides use the FAQ numbers
+
+[profiles.faq.corpus]                   # 43 FAQ answers, k = 60, 327 terms
+use_quora = false
+
+[profiles.faq.eval]
+pairs = "faq"                           # judge the FAQ model on the FAQ's held-out phrasings
+
+[profiles.quora.corpus]                 # 100k Quora questions + the FAQ, k = 200, 40,000 terms
+use_quora = true
+require_quora = true
+
+[profiles.quora.cache]
+lsa_weight = 0.5                        # the evaluation's blend sweep recommends the hybrid score
+min_latent_coverage = 0.25              # chosen from the guard sweep (latent stopwords off, k = 200)

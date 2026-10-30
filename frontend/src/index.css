@@ -1,0 +1,230 @@
+@import "tailwindcss";
+
+/* present:... styles apply in presentation mode (html[data-present]). */
+@custom-variant present (&:where([data-present], [data-present] *));
+
+/* Design tokens: every colour lives here. Light page in white lilac with dark-blue text;
+   the live math panel is a dark-blue card. Text colours meet WCAG AA (4.5:1) on the
+   backgrounds they are used on: the bright hit/miss/blurple fills are for shapes and
+   for text on the dark panel; the darker *-text variants are for text on light. */
+@theme {
+  /* page */
+  --color-paper: #f8f8f9;
+  --color-sheet: #ffffff;
+  --color-ink: #111439;
+  --color-ink-soft: #474c6b;
+  --color-ink-faint: #5e6384;
+  --color-rule: #e4e5ee;
+  --color-query: #4b44e0;      /* blurple, text-safe on light */
+  --color-hit: #1a7350;        /* hit, text-safe on light */
+  --color-miss: #8f5300;       /* miss, text-safe on light */
+  --color-hit-wash: #e4f5ec;
+  --color-miss-wash: #fdf1dc;
+
+  /* brand gradient and fills */
+  --color-blurple: #635bff;
+  --color-violet: #a960ee;
+  --color-pink: #ff5c8a;
+  --color-amber: #ffb547;
+  --color-cyan: #00d4ff;
+  --color-hit-fill: #2fb37f;
+  --color-miss-fill: #f5a623;
+
+  /* the dark math panel */
+  --color-navy: #111439;
+  --color-navy-2: #1a1e4a;
+  --color-navy-line: #2a2f63;
+  --color-p-text: #ecedf8;
+  --color-p-soft: #b9bcdb;
+  --color-p-faint: #9196c2;
+  --color-p-accent: #a6a1ff;
+
+  /* diverging heatmap: positive blue, negative amber, zero dark */
+  --color-heat-pos: #5b8cff;
+  --color-heat-neg: #f5a623;
+  --color-heat-zero: #1a1e4a;
+
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-math: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
+
+  --shadow-card: 0 1px 2px rgba(17, 20, 57, 0.06), 0 8px 24px -8px rgba(17, 20, 57, 0.14);
+  --radius-card: 16px;
+}
+
+@layer base {
+  html {
+    background: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    margin: 0;
+    min-height: 100vh;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-blurple);
+    outline-offset: 2px;
+  }
+  button {
+    cursor: pointer;
+  }
+}
+
+@layer components {
+  /* Numbers: mono, tabular, so columns of figures line up and don't jitter while they animate. */
+  .num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+  .threshold {
+    accent-color: var(--color-hit-fill);
+  }
+  .card {
+    background: var(--color-sheet);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-card);
+  }
+
+  /* Inside the dark panel the page tokens flip, so shared pieces (AngleFan, word effects)
+     draw light-on-dark without their own dark variants. */
+  .panel-dark {
+    --color-ink: var(--color-p-text);
+    --color-ink-soft: var(--color-p-soft);
+    --color-ink-faint: var(--color-p-faint);
+    --color-rule: var(--color-navy-line);
+    --color-sheet: var(--color-navy);
+    --color-paper: var(--color-navy-2);
+    --color-query: var(--color-p-accent);
+    --color-hit: var(--color-hit-fill);
+    --color-miss: var(--color-miss-fill);
+    --color-hit-wash: rgba(47, 179, 127, 0.18);
+    --color-miss-wash: rgba(245, 166, 35, 0.16);
+    background: var(--color-navy);
+    color: var(--color-p-text);
+    border-radius: var(--radius-card);
+    box-shadow: 0 20px 50px -20px rgba(17, 20, 57, 0.55);
+  }
+  .panel-dark .katex {
+    color: var(--color-p-text);
+  }
+
+  /* The signature gradient band behind the top bar: soft blobs drifting on a -12° slant. */
+  .hero-band {
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 360px;
+    overflow: hidden;
+    transform: skewY(-12deg);
+    transform-origin: top left;
+    background: linear-gradient(100deg, #635bff 0%, #a960ee 30%, #ff5c8a 55%, #ffb547 78%, #00d4ff 100%);
+    z-index: 0;
+  }
+  .hero-band::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(180deg, rgba(248, 248, 249, 0) 55%, rgba(248, 248, 249, 0.85) 100%);
+  }
+  .hero-band span {
+    position: absolute;
+    width: 46vw;
+    height: 46vw;
+    max-width: 760px;
+    max-height: 760px;
+    border-radius: 50%;
+    filter: blur(70px);
+    opacity: 0.75;
+    animation: drift 20s ease-in-out infinite alternate;
+  }
+  .hero-band span:nth-child(1) { background: #635bff; left: -8%; top: -40%; }
+  .hero-band span:nth-child(2) { background: #ff5c8a; left: 30%; top: -55%; animation-delay: -5s; animation-duration: 24s; }
+  .hero-band span:nth-child(3) { background: #ffb547; left: 62%; top: -30%; animation-delay: -11s; }
+  .hero-band span:nth-child(4) { background: #00d4ff; left: 82%; top: -60%; animation-delay: -16s; animation-duration: 26s; }
+  .hero-band span:nth-child(5) { background: #a960ee; left: 10%; top: 10%; animation-delay: -8s; animation-duration: 22s; }
+
+  /* Word chips (stage 1) */
+  .chip {
+    animation: chip-in 380ms cubic-bezier(.2, .7, .2, 1) both;
+  }
+  .glow {
+    box-shadow: 0 0 0 1px rgba(166, 161, 255, 0.7), 0 0 14px 2px rgba(99, 91, 255, 0.55);
+  }
+}
+
+@keyframes drift {
+  0% { transform: translate3d(0, 0, 0) scale(1); }
+  50% { transform: translate3d(6vw, 4vh, 0) scale(1.12); }
+  100% { transform: translate3d(-4vw, 8vh, 0) scale(0.94); }
+}
+@keyframes chip-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.96); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes fly-in {
+  from { transform: translateY(-160px); opacity: 0.2; }
+  to { transform: translateY(0); opacity: 1; }
+}
+@keyframes grow {
+  from { width: 0; }
+  to { width: 100%; }
+}
+@keyframes sweep {
+  from { transform: translateY(0); opacity: 1; }
+  95% { opacity: 1; }
+  to { transform: translateY(var(--sweep-to)); opacity: 0; }
+}
+
+/* Presentation mode (focus layout): a compact strip on the left and the current stage
+   filling the rest of the screen. Text sizes follow the screen height (2.6vh = 28 px at
+   1080p); the drawings take all the space that is left, so they grow with the screen. */
+html[data-present],
+html[data-present] body {
+  overflow: hidden;
+}
+html[data-present] .hide-in-present {
+  display: none !important;
+}
+html[data-present] .math-panel figcaption {
+  display: none;
+}
+.stage-fig {
+  height: 46vw;
+}
+.stage-fig > svg,
+.stage-fig > figure {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.stage-fig figure {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+}
+.stage-fig figure > svg {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+}
+@media (min-width: 1280px) {
+  .stage-fig {
+    height: auto;
+    flex: 1 1 0%;
+    min-height: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0ms !important;
+    animation-duration: 0ms !important;
+    animation-iteration-count: 1 !important;
+  }
+  .hero-band span {
+    animation-play-state: paused !important;
+  }
+}

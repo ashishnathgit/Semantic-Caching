@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+
+# Built model, saved cache and evaluation output (recreate with `python -m semcache build`)
+artifacts/
+
+# Downloaded data (recreate with `python scripts/download_qqp.py`)
+data/quora/
+
+# Frontend dependencies. frontend/dist is kept in the repo on purpose, so the UI works
+# with Python alone; rebuild it with `npm run build` after changing the frontend.
+frontend/node_modules/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# Review screenshots at other sizes and recording frames (regenerate with scripts/screenshots.mjs)
+docs/screenshots/1440x900/
+docs/screenshots/1280x720/
+docs/screenshots/*/frames/
+
+# Zips made by scripts/package_zip.py, and local secrets
+*.zip
+.env
+.env.*

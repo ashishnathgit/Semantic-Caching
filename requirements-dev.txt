@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=8.0
+httpx>=0.27            # FastAPI's TestClient
+scikit-learn>=1.4      # optional: tests compare our TF-IDF with scikit-learn's
+jupyter                # run the notebook locally
+datasets>=2.18         # scripts/download_qqp.py (Quora Question Pairs from Hugging Face)
