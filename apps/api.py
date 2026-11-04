@@ -39,6 +39,17 @@ Endpoints, all under /api:
     POST   /reset               admin: reset the shared cache to the FAQ;
                                 anyone else: remove their private entries, zero their counters
     GET    /model               embedder details, singular values, top terms per direction
+    POST   /admin/import-csv    admin: {profile, csv}: a NEW profile from an FAQ CSV (question, answer)
+    POST   /admin/entries/delete  admin: {ids}: delete several cached questions at once
+    POST   /admin/forget-llm    admin: remove every LLM-produced answer (FAQ and hand-added stay)
+    POST   /feedback/wrong      {query, entry_id}: "wrong answer" on a hit: log the pair, evict the entry
+    GET    /model/status        growing model (faq-live): k, vocabulary, entries since the last fit
+    POST   /admin/rebuild       admin: refit on the FAQ + every cached answer in the background, then swap
+    GET    /lab/correctness     Matrix Lab: Eckart-Young check, ||V^T V - I||, Jacobi trace, spectrum
+    POST   /lab/worked          {query}: the worked numbers (idf, TF-IDF row, e, cosine as a sum, angles)
+    POST   /lab/ops             {query}: FLOPs for a hit vs an LLM answer (an estimate)
+    POST   /lab/refit           {k, query?}: a sandbox model with another k (the served one never changes)
+    GET    /lab/latency         per-request latency, hits vs LLM calls (?limit=500&scope=global|user)
 
 Interactive docs: http://localhost:8000/docs
 After `npm run build` in frontend/, the built UI is served at http://localhost:8000/ too.
@@ -75,6 +86,21 @@ class EntryRequest(BaseModel):
     question: str = Field(min_length=1, max_length=MAX_QUERY_CHARS)
     answer: str = Field(min_length=1, max_length=20000)
     shared: bool = False
+    ttl_seconds: float | None = Field(default=None, ge=0, le=10 * 365 * 86400)   # None = the profile default
+
+
+class DeleteEntriesRequest(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=10000)
+
+
+class ImportRequest(BaseModel):
+    profile: str = Field(min_length=1, max_length=40)
+    csv: str = Field(min_length=1, max_length=2_100_000)
+
+
+class WrongAnswerRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=MAX_QUERY_CHARS)
+    entry_id: int
 
 
 class SessionRequest(BaseModel):
@@ -87,6 +113,16 @@ class ThreadRequest(BaseModel):
 
 class RenameRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
+
+
+class LabQuery(BaseModel):
+    query: str = Field(min_length=1, max_length=MAX_QUERY_CHARS)
+    threshold: float | None = Field(default=None, gt=0.0, le=1.0)
+
+
+class RefitRequest(BaseModel):
+    k: int = Field(ge=1, le=5000)
+    query: str | None = Field(default=None, max_length=MAX_QUERY_CHARS)
 
 
 def _thread_dict(thread: Thread) -> dict:
@@ -148,6 +184,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "defaults": {"threshold": settings.cache.threshold, "top_k": settings.cache.top_k,
                              "min_latent_coverage": settings.cache.min_latent_coverage},
                 "follow_up_detection": settings.users.detect_follow_ups,
+                "model_status": svc.model_status(),
                 "admin_enabled": admin_key_configured()}
 
     @app.get("/api/model")
@@ -265,7 +302,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                   admin: bool = Depends(is_admin)):
         try:
             return service(request).add_entry(body.question, body.answer, user=user,
-                                              shared=body.shared, admin=admin).to_dict()
+                                              shared=body.shared, admin=admin,
+                                              ttl_seconds=body.ttl_seconds).to_dict()
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ValueError as exc:
@@ -312,6 +350,102 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/reset")
     def reset(request: Request, user: str = Depends(required_user), admin: bool = Depends(is_admin)):
         return service(request).reset_for(user, admin)
+
+    # ------------------------------------------------------ data and admin
+    @app.post("/api/admin/import-csv", status_code=201)
+    def import_csv(body: ImportRequest, request: Request, user: str = Depends(required_user),
+                   admin: bool = Depends(is_admin)):
+        """Admin: build a NEW profile from an FAQ CSV (question, answer). Never touches faq."""
+        try:
+            return service(request).import_csv(body.profile, body.csv, admin=admin)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/admin/entries/delete")
+    def delete_entries(body: DeleteEntriesRequest, request: Request, user: str = Depends(required_user),
+                       admin: bool = Depends(is_admin)):
+        """Admin: delete several cached questions at once (any owner)."""
+        try:
+            return service(request).remove_entries(body.ids, admin=admin)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.post("/api/admin/forget-llm")
+    def forget_llm(request: Request, user: str = Depends(required_user), admin: bool = Depends(is_admin)):
+        """Admin: remove every answer an LLM produced; FAQ and hand-added answers stay."""
+        try:
+            return service(request).forget_llm_rows(admin=admin)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.post("/api/feedback/wrong")
+    def wrong_answer(body: WrongAnswerRequest, request: Request, user: str = Depends(required_user),
+                     admin: bool = Depends(is_admin)):
+        """"Wrong answer" on a hit: logs the pair for threshold tuning and evicts the entry."""
+        try:
+            return service(request).report_wrong(body.query, body.entry_id, user=user, admin=admin)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # ---------------------------------------------------- growing model
+    @app.get("/api/model/status")
+    def model_status(request: Request):
+        """Live-rebuild state: k, vocabulary, new entries since the last fit, last rebuild."""
+        return service(request).model_status()
+
+    @app.post("/api/admin/rebuild", status_code=202)
+    def rebuild(request: Request, user: str = Depends(required_user), admin: bool = Depends(is_admin)):
+        """Admin: refit the model on the FAQ plus every cached answer, in the background."""
+        try:
+            return service(request).request_rebuild(admin=admin)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # -------------------------------------------------------- matrix lab
+    # Checks and worked numbers for the "Matrix Lab" tab; none of them change the served model.
+    @app.get("/api/lab/correctness")
+    def lab_correctness(request: Request):
+        return service(request).lab.correctness()
+
+    @app.post("/api/lab/worked")
+    def lab_worked(body: LabQuery, request: Request, user: str | None = Depends(optional_user),
+                   admin: bool = Depends(is_admin)):
+        try:
+            return service(request).lab.worked(body.query, body.threshold, user=user, admin=admin)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/lab/ops")
+    def lab_ops(body: LabQuery, request: Request, user: str | None = Depends(optional_user)):
+        try:
+            return service(request).lab.ops(body.query, user=user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/lab/refit")
+    def lab_refit(body: RefitRequest, request: Request, user: str = Depends(required_user)):
+        """Fit a sandbox model with another k. The served model and the cache never change."""
+        try:
+            return service(request).lab.refit(body.k, body.query, user=user)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/lab/latency")
+    def lab_latency(request: Request, limit: int = 500, scope: str = "global",
+                    user: str | None = Depends(optional_user)):
+        if scope not in ("global", "user"):
+            raise HTTPException(status_code=422, detail="scope must be global or user")
+        return service(request).lab.latency(max(1, min(limit, 5000)), user if scope == "user" else None)
 
     if Path(FRONTEND_DIST, "index.html").exists():
         app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")

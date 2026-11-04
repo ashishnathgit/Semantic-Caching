@@ -1,5 +1,5 @@
 import type { Metrics } from "../types";
-import { formatMs } from "./sources";
+import { backendLabel, formatMs } from "./sources";
 
 const DASH = "—";
 const pct = (v: number | null) => (v === null ? DASH : `${(v * 100).toFixed(1)}%`);
@@ -55,8 +55,14 @@ export function StatsCards({ metrics, scope, onScope, user }: Props) {
         <Card label={s?.hit_rate_label ?? "Hit rate (of cache lookups)"} value={pct(s?.hit_rate ?? null)}
           sub={`of all requests: ${pct(s?.hit_rate_of_requests ?? null)}`}
           title="Follow-ups and forced refreshes skip the cache, so they are left out: hits / (hits + misses)." />
-        <Card label="LLM calls" value={s ? String(s.llm_calls) : DASH} sub="misses, follow-ups and refreshes" />
-        <Card label="LLM fallbacks" value={s ? String(s.llm_fallbacks) : DASH} sub="Ollama failed, the placeholder answered" />
+        <Card label="LLM calls" value={s ? String(s.llm_calls) : DASH}
+          sub={s?.by_backend && Object.keys(s.by_backend).length
+            ? Object.entries(s.by_backend).map(([b, n]) => `${backendLabel(b)} ${n}`).join(" · ")
+            : "misses, follow-ups and refreshes"} />
+        <Card label="LLM fallbacks" value={s ? String(s.llm_fallbacks) : DASH} sub="no model answered, the placeholder did"
+          title={s?.by_backend && Object.keys(s.by_backend).length
+            ? "Answered by: " + Object.entries(s.by_backend).map(([b, n]) => `${backendLabel(b)} ${n}`).join(", ")
+            : undefined} />
         <Card label="Est. LLM cost" value={usd(cost?.llm_cost_usd)} sub={priceSub} />
         <Card label="Est. savings" value={usd(cost?.savings_usd)} sub={cost ? "what the hits would have cost" : priceSub} />
         <Card label="Avg latency: hit vs LLM"

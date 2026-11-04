@@ -1,8 +1,11 @@
 """Who answers a query when the cache misses.
 
-* OllamaBackend   a local LLM served by Ollama (http://localhost:11434)
-* StubBackend     a placeholder answer, so the project runs without any LLM
-* FallbackBackend tries the first backend, uses the second if it fails
+* OllamaBackend           a local LLM served by Ollama (http://localhost:11434)
+* OpenAICompatibleBackend an online model behind an OpenAI-style /chat/completions API
+                          (base URL, model and API key from .env; the key never leaves here)
+* StubBackend             a placeholder answer, so the project runs without any LLM
+* FallbackBackend         tries the first backend, uses the second if it fails
+* ChainBackend            [llm] chain: tries each backend in order, e.g. online -> Ollama -> stub
 
 Every backend has ``generate(prompt, history=None)``. ``history`` is a list of
 earlier ``{"role": "user" | "assistant", "content": ...}`` messages of the
@@ -29,8 +32,9 @@ class Generation:
     cacheable: bool = True       # False: never stored in the shared cache
     error: str | None = None     # why the primary backend failed, when a fallback answered
     fallback: bool = False       # the fallback answered because the primary failed
-    prompt_tokens: int | None = None   # Ollama's prompt_eval_count (None: not reported)
-    output_tokens: int | None = None   # Ollama's eval_count
+    prompt_tokens: int | None = None   # Ollama's prompt_eval_count / the API's usage (None: not reported)
+    output_tokens: int | None = None   # Ollama's eval_count / the API's completion_tokens
+    tried: list | None = None          # ChainBackend: [{"backend", "error"}] for each backend that failed first
 
 
 class BackendError(RuntimeError):
@@ -207,18 +211,175 @@ class FallbackBackend:
             return result
 
 
+class OpenAICompatibleBackend:
+    """An online model behind an OpenAI-compatible API (OpenAI, Groq, Together, OpenRouter,
+    a local vLLM ...): POST {base_url}/chat/completions with a Bearer key.
+
+    The API key is read from the environment (.env) and is only ever put in the
+    Authorization header: describe() never includes it, and error messages are redacted.
+    Online mode sends every question that misses the cache to the provider.
+    """
+
+    name = "openai_compatible"
+
+    def __init__(self, base_url: str, model: str, api_key: str | None, temperature: float = 0.2,
+                 timeout_s: float = 60.0, system_prompt: str = "Answer clearly and concisely in 2-4 sentences.",
+                 max_tokens: int | None = None):
+        self.base_url = (base_url or "").rstrip("/")
+        self.requested_model = model or ""
+        self._key = api_key or ""
+        self.temperature, self.timeout_s, self.system_prompt = temperature, timeout_s, system_prompt
+        self.max_tokens = max_tokens
+
+    @property
+    def model(self) -> str:
+        return self.requested_model
+
+    def _redact(self, text: str) -> str:
+        return text.replace(self._key, "***") if self._key else text
+
+    def missing(self) -> list[str]:
+        return [n for n, v in (("base URL", self.base_url), ("model", self.requested_model),
+                               ("API key", self._key)) if not v]
+
+    def available(self) -> bool:
+        return not self.missing()
+
+    def describe(self) -> dict:
+        # Never the key: only whether one is set.
+        info = {"backend": self.name, "available": self.available(), "url": self.base_url,
+                "model": self.requested_model or None, "api_key_set": bool(self._key)}
+        if self.missing():
+            info["error"] = "not configured: missing " + ", ".join(self.missing()) + " (see .env.example)"
+        return info
+
+    def warm_up(self) -> None:
+        """Nothing to load locally."""
+
+    def generate(self, prompt: str, history: list[dict] | None = None) -> Generation:
+        if self.missing():
+            raise BackendError("online model not configured: missing " + ", ".join(self.missing()))
+        t0 = time.perf_counter()
+        messages = [{"role": "system", "content": self.system_prompt},
+                    *({"role": m["role"], "content": m["content"]} for m in (history or [])),
+                    {"role": "user", "content": prompt}]
+        payload = {"model": self.requested_model, "messages": messages, "temperature": self.temperature,
+                   "stream": False}
+        if self.max_tokens:
+            payload["max_tokens"] = int(self.max_tokens)
+        req = urllib.request.Request(f"{self.base_url}/chat/completions", data=json.dumps(payload).encode("utf-8"),
+                                     headers={"Content-Type": "application/json",
+                                              "Authorization": f"Bearer {self._key}"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            raise BackendError(self._redact(f"online model returned HTTP {exc.code}: {detail}")) from None
+        except (urllib.error.URLError, OSError) as exc:
+            raise BackendError(self._redact(f"cannot reach the online model at {self.base_url} ({exc})")) from None
+        try:
+            out = json.loads(body.decode("utf-8"))
+            text = (out["choices"][0]["message"]["content"] or "").strip()
+        except (ValueError, KeyError, IndexError, TypeError):
+            raise BackendError(self._redact(f"unexpected reply from the online model: {body[:200]!r}")) from None
+        if not text:
+            raise BackendError("the online model returned an empty answer")
+        usage = out.get("usage") or {}
+        return Generation(text, self.name, out.get("model") or self.requested_model,
+                          (time.perf_counter() - t0) * 1000.0,
+                          prompt_tokens=_count(usage.get("prompt_tokens")),
+                          output_tokens=_count(usage.get("completion_tokens")))
+
+
+class ChainBackend:
+    """Try each backend in order; the first answer wins. A real model further down the chain
+    is cached like any answer; a placeholder that answers only because everything before it
+    failed is marked as a fallback and never cached."""
+
+    def __init__(self, backends: list):
+        if not backends:
+            raise ValueError("the [llm] chain is empty")
+        self.backends = backends
+        self.name = "+".join(b.name for b in backends)
+        self.primary = backends[0]
+
+    def available(self) -> bool:
+        return any(b.available() for b in self.backends)
+
+    def warm_up(self) -> None:
+        for b in self.backends:
+            if isinstance(b, OllamaBackend):
+                b.warm_up()
+                return
+
+    def describe(self) -> dict:
+        for b in self.backends:
+            if isinstance(b, StubBackend) and b is not self.backends[0]:
+                continue
+            info = b.describe()
+            if info.get("available"):
+                break
+        else:
+            info = self.backends[0].describe()
+        return {**info, "chain": [b.name for b in self.backends],
+                "chain_status": [{"backend": b.name, "available": b.available() if not isinstance(b, OllamaBackend)
+                                  else None} for b in self.backends]}
+
+    def generate(self, prompt: str, history: list[dict] | None = None) -> Generation:
+        tried: list[dict] = []
+        for i, b in enumerate(self.backends):
+            try:
+                g = b.generate(prompt, history) if history else b.generate(prompt)
+            except BackendError as exc:
+                tried.append({"backend": b.name, "error": str(exc)})
+                continue
+            if tried:
+                g.tried = tried
+                g.error = "; ".join(f"{t['backend']}: {t['error']}" for t in tried)
+                if isinstance(b, StubBackend):            # a stand-in, not a model answer
+                    g.fallback, g.cacheable = True, False
+            return g
+        raise BackendError("every backend in the chain failed: "
+                           + "; ".join(f"{t['backend']}: {t['error']}" for t in tried))
+
+
+BACKENDS = ("ollama", "openai_compatible", "stub")
+
+
+def _make(name: str, llm_settings, stub_cacheable: bool):
+    if name == "stub":
+        return StubBackend(llm_settings.stub_delay_ms, stub_cacheable)
+    if name == "ollama":
+        return OllamaBackend(llm_settings.ollama_url, llm_settings.model, llm_settings.temperature,
+                             llm_settings.timeout_s, llm_settings.system_prompt)
+    if name == "openai_compatible":
+        import os
+        return OpenAICompatibleBackend(
+            os.environ.get("SEMCACHE_OPENAI_BASE_URL") or llm_settings.openai_base_url,
+            os.environ.get("SEMCACHE_OPENAI_MODEL") or llm_settings.openai_model,
+            os.environ.get(llm_settings.openai_api_key_env), llm_settings.temperature,
+            llm_settings.timeout_s, llm_settings.system_prompt, llm_settings.openai_max_tokens)
+    raise ValueError(f"unknown llm backend {name!r} (use one of {', '.join(BACKENDS)})")
+
+
 def build_backend(llm_settings) -> object:
     """Create the backend described by the [llm] section of config.toml.
 
     Placeholder answers are cached only when the stub is the chosen backend (and
     ``cache_stub_answers`` is on); as a fallback for Ollama they never are.
     """
+    chain = list(getattr(llm_settings, "chain", None) or [])
+    if chain:
+        # [llm] chain = ["openai_compatible", "ollama", "stub"]: the stub caches its placeholder
+        # only when it is first in the chain (then it is the chosen backend).
+        return ChainBackend([_make(n, llm_settings, i == 0 and llm_settings.cache_stub_answers)
+                             for i, n in enumerate(chain)])
     explicit_stub = llm_settings.backend == "stub"
     stub = StubBackend(llm_settings.stub_delay_ms, explicit_stub and llm_settings.cache_stub_answers)
     if llm_settings.backend == "stub":
         return stub
-    if llm_settings.backend != "ollama":
-        raise ValueError(f"unknown llm backend {llm_settings.backend!r} (use 'ollama' or 'stub')")
-    ollama = OllamaBackend(llm_settings.ollama_url, llm_settings.model, llm_settings.temperature,
-                           llm_settings.timeout_s, llm_settings.system_prompt)
-    return FallbackBackend(ollama, stub) if llm_settings.fallback_to_stub else ollama
+    if llm_settings.backend not in BACKENDS:
+        raise ValueError(f"unknown llm backend {llm_settings.backend!r} (use one of {', '.join(BACKENDS)})")
+    primary = _make(llm_settings.backend, llm_settings, False)
+    return FallbackBackend(primary, stub) if llm_settings.fallback_to_stub else primary

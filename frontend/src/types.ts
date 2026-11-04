@@ -61,6 +61,7 @@ export interface AskResult {
   output_tokens: number | null;
   stored_vector: number[] | null; // the new row of C after a miss
   cache_rows: number; // rows of C this user's lookups see, after this answer
+  route: Route | null; // exact? -> guards -> score vs tau -> angle -> outcome
 }
 
 export interface LookupResult {
@@ -110,6 +111,8 @@ export interface BackendInfo {
   url?: string;
   error?: string;
   fallback?: string;
+  chain?: string[];
+  api_key_set?: boolean;
   installed_models?: string[];
   warmup?: { state: "not needed" | "warming" | "ready" | "failed"; ms: number | null; error: string | null };
 }
@@ -132,6 +135,24 @@ export interface Health {
   defaults: { threshold: number; top_k: number; min_latent_coverage: number };
   follow_up_detection: boolean;
   admin_enabled: boolean; // SEMCACHE_ADMIN_KEY is set on the server
+  model_status?: ModelStatus;
+}
+
+// GET /api/model/status: the growing model of profiles with corpus.include_cached (faq-live)
+export interface ModelStatus {
+  state: "idle" | "running" | "done" | "failed";
+  reason: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+  seconds: number | null;
+  error: string | null;
+  generation: number;
+  grows: boolean;
+  rebuild_every: number;
+  new_since_build: number;
+  k: number;
+  vocabulary_size: number;
+  documents: number;
 }
 
 export interface Direction {
@@ -156,6 +177,26 @@ export interface CacheEntry {
   hits: number;
   model: string | null;
   owner: string | null; // null = shared with everyone
+  expires_at?: number | null; // unix time after which it is a miss (null = never)
+}
+
+export interface ImportResult {
+  profile: string;
+  questions: number;
+  entries: number;
+  k: number;
+  vocabulary_size: number;
+  training_documents: number;
+  folder: string;
+  evaluable: boolean;
+  serve: string;
+}
+
+export interface WrongAnswerResult {
+  evicted: boolean;
+  note: string;
+  score: number | null;
+  tau: number;
 }
 
 export interface Profile {
@@ -291,7 +332,8 @@ export interface Explanation {
   query: string;
   normalized: string;
   threshold: number;
-  verdict: "exact" | "empty" | "no_known_words" | "guard" | "hit" | "miss";
+  verdict: "exact" | "empty" | "no_known_words" | "guard" | "hit" | "miss" | "refused";
+  refused?: { rule: string; detail: string; entry_id: number; score: number }; // negation guard (off on faq)
   hit: boolean;
   score: number;
   method: string;
@@ -301,7 +343,11 @@ export interface Explanation {
   rho_blocked: boolean;
   tokens: ExplainToken[];
   bigrams: { term: string; known: boolean }[];
-  coverage: { known: number; total: number; ratio: number; min_ratio: number; passed: boolean };
+  coverage: {
+    known: number; total: number; ratio: number; min_ratio: number; passed: boolean;
+    relaxed?: boolean; // passed only by the topic-word rule: matched on its known topic words
+    topic_known?: string[]; topic_unknown?: string[]; everyday_unknown?: string[];
+  };
   terms: ExplainTerm[];
   latent: number[];
   latent_top: LatentTop[];
@@ -360,6 +406,7 @@ export interface MetricsSummary {
   time_saved_ms: number | null;
   time_saved_basis: string;
   tokens: { input: number; output: number; calls_with_counts: number };
+  by_backend?: Record<string, number>; // LLM calls per backend that answered
   cost: null | {
     estimated: true;
     label: string;
@@ -385,4 +432,154 @@ export interface Metrics {
   pricing: { configured: boolean; label: string | null; note: string | null };
   summary: MetricsSummary;
   series: { bucket_seconds: number; points: MetricsPoint[]; truncated: boolean };
+}
+
+// ------------------------------------------------------------------ route trace (semcache/route.py)
+export interface RouteStep {
+  id: string; // exact | known | rho | negation | score | angle | cache
+  label: string;
+  value: string;
+  status: "yes" | "no" | "pass" | "fail" | "info" | "off" | "skipped";
+  detail: string;
+}
+
+export interface Route {
+  steps: RouteStep[];
+  outcome: { kind: "HIT" | "LLM" | "BLOCKED"; guard: string | null; detail: string; then: string | null };
+}
+
+// ------------------------------------------------------------------ Matrix Lab (semcache/lab.py)
+export interface LabCorrectness {
+  profile: string;
+  shape: [number, number];
+  nnz: number;
+  k: number;
+  frobenius_sq: number;
+  eckart_young: {
+    residual_sq: number;
+    dropped_sigma_sq: number;
+    difference: number;
+    relative: number;
+    equal: boolean;
+    residual_method: string;
+    dropped_method: string;
+  };
+  orthogonality: { value: number; ok: boolean };
+  sigma_check: { max_abs_diff: number | null };
+  jacobi: {
+    path: string;
+    size: number;
+    sweeps: number;
+    rotations: number;
+    seconds: number;
+    converged: boolean;
+    tol: number;
+    frobenius: number;
+    off_norms: number[];
+    svd_seconds: number;
+  };
+  spectrum: { sigma: number[]; energy_cumulative: number[]; full: boolean; k: number; energy_kept: number };
+}
+
+export interface LabTerm {
+  term: string;
+  tf: number;
+  df: number;
+  idf: number;
+  tf_weight: number;
+  raw: number;
+  weight: number;
+  bigram: boolean;
+}
+
+export interface LabWorked {
+  query: string;
+  N: number;
+  smooth_idf: boolean;
+  sublinear_tf: boolean;
+  rarest: LabTerm | null;
+  terms: LabTerm[];
+  norm: number;
+  k: number;
+  latent_norm: number;
+  rho: number;
+  e: number[];
+  e_top: { j: number; value: number }[];
+  tau: number;
+  theta_tau_deg: number;
+  hit: boolean;
+  refused: { rule: string; detail: string } | null;
+  match: null | {
+    query: string;
+    hidden: boolean;
+    exact: boolean;
+    score: number;
+    lsa: number;
+    tfidf: number | null;
+    scored_by: ScoredBy;
+    lsa_weight: number;
+    top: { j: number; e: number; f: number; product: number }[];
+    rest: number;
+    terms_in_sum: number;
+    theta_deg: number;
+  };
+  route: Route;
+}
+
+export interface LabOps {
+  query: string;
+  nnz: number;
+  k: number;
+  n: number;
+  hit: { parts: { step: string; formula: string; flops: number }[]; flops: number };
+  llm: null | {
+    model: string;
+    model_basis: string;
+    params_billion: number;
+    prompt_tokens: number;
+    output_tokens: number;
+    token_basis: string;
+    flops: number;
+    formula: string;
+    note: string;
+  };
+  ratio: number | null;
+  missing: string | null;
+}
+
+export interface LabHeadline {
+  auc: number;
+  precision: number;
+  recall: number;
+  accepted_hits: number;
+  accepted_hits_correct: number;
+  random_false_hits: number | null;
+  random_asked: number | null;
+  best_f1: number;
+  best_f1_tau: number;
+  tau: number;
+}
+
+export interface LabRefit {
+  k: number;
+  requested_k: number;
+  seconds: number;
+  vocabulary_size: number;
+  energy_kept: number;
+  sigma: number[];
+  eckart_young: { residual_sq: number; dropped_sigma_sq: number; equal: boolean };
+  headline: LabHeadline;
+  served_headline: LabHeadline;
+  served: { k: number; fingerprint: string };
+  question: null | { query: string; sandbox_score: number; sandbox_hit: boolean; served_score: number; served_hit: boolean };
+}
+
+export interface LabLatencyPoint {
+  t: number;
+  kind: "hit" | "miss" | "follow_up" | "refresh";
+  total_ms: number | null;
+  llm_ms: number | null;
+  llm: boolean;
+  fallback: boolean;
+  backend: string | null;
 }

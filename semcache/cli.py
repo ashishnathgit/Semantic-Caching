@@ -15,6 +15,7 @@ or the SEMCACHE_PROFILE environment variable).
     reset-demo  exactly the FAQ answers, metrics archived, every user's counters zeroed
     preflight   PASS/FAIL checks to run right before going on stage
     evaluate    precision/recall, rank sweep, latency report
+    measure     headline numbers, traffic mix, tau cross-validation, LSH sweep, fact checks
     backend     check whether Ollama is reachable
     serve       start the FastAPI server (for the React UI)
     gradio      start the Gradio demo
@@ -267,11 +268,29 @@ def cmd_warm(args) -> int:
 
 def cmd_evaluate(args) -> int:
     from .evaluate import guard_sweep, run_evaluation
+    if args.neural:
+        from .neural import available, neural_comparison, neural_markdown
+        if not available():
+            print("error: the neural baseline needs: pip install -r requirements-neural.txt", file=sys.stderr)
+            return 1
+        settings = _settings(args)
+        result = neural_comparison(settings)
+        settings.eval_dir.mkdir(parents=True, exist_ok=True)
+        (settings.eval_dir / "neural_baseline.md").write_text(neural_markdown(result), encoding="utf-8")
+        print(f"  report: {settings.eval_dir / 'neural_baseline.md'}")
+        return 0
     if args.guard_sweep:
         guard_sweep(_settings(args), max_pairs=args.max_pairs)
         return 0
     run_evaluation(_settings(args), pairs_path=args.pairs, max_pairs=args.max_pairs,
                    charts=not args.no_charts)
+    return 0
+
+
+def cmd_measure(args) -> int:
+    from .measure import run_measurements
+    only = [x.strip() for x in args.only.split(",")] if args.only else None
+    run_measurements(_settings(args), only=only)
     return 0
 
 
@@ -367,14 +386,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--pairs", help="CSV/TSV of question pairs (default: Quora validation file)")
     p.add_argument("--max-pairs", type=int)
     p.add_argument("--no-charts", action="store_true")
+    p.add_argument("--neural", action="store_true",
+                   help="compare LSA with a MiniLM baseline (needs requirements-neural.txt)")
     p.add_argument("--guard-sweep", action="store_true",
                    help="refit for latent stopwords on/off x k = 200/300/400 x rho cutoffs (slow)")
     p.set_defaults(func=cmd_evaluate)
 
+    p = add("measure", help="headline numbers, traffic mix, tau cross-validation, LSH sweep, fact checks")
+    p.add_argument("--only", help="comma-separated: headline,traffic,tau_cv,lsh,facts,latent,incremental,thresholds,neural,guard")
+    p.set_defaults(func=cmd_measure)
+
     add("backend", help="check the LLM backend").set_defaults(func=cmd_backend)
 
     p = add("serve", help="start the FastAPI server")
-    p.add_argument("--backend", choices=["ollama", "stub"],
+    p.add_argument("--backend", choices=["ollama", "openai_compatible", "stub"],
                    help="override [llm] backend; stub = placeholder answers, cached (the stage fallback)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)

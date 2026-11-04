@@ -28,7 +28,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from . import linalg as la
-from .text import STOPWORDS, Vocabulary, analyze, fold_plural, tokenize
+from .text import EVERYDAY_WORDS, STOPWORDS, Vocabulary, analyze, fold_plural, tokenize
 
 DEFAULT_LATENT_STOPWORDS = ["what", "how", "why", "which", "best", "way", "good", "can", "does"]
 
@@ -53,6 +53,44 @@ class EmbedderConfig:
     latent_stopwords: list[str] = field(default_factory=lambda: list(DEFAULT_LATENT_STOPWORDS))
 
 
+@dataclass(frozen=True)
+class KnownWordPolicy:
+    """The known-word guard's topic-word rule (a query-time policy, not part of the fitted
+    model, so it is not in the fingerprint).
+
+    The plain rule: at least ``min_known_ratio`` of a question's content words must be in
+    the vocabulary, else it can only hit by exact repeat. A long, wordy question fails it
+    through everyday words the model never saw ("where do I go to ... the old one").
+    This policy gives such a question a second chance: counting only topic words (content
+    words that are not EVERYDAY_WORDS), it needs at least ``min_topic_words`` known ones and
+    ``min_topic_ratio`` of its topic words known. It is then matched on its known topic
+    words alone, so known everyday words ("why", "find") can't carry it to a hit either.
+    """
+    min_topic_words: int = 2
+    min_topic_ratio: float = 0.4
+    everyday: frozenset = field(default=EVERYDAY_WORDS | frozenset(fold_plural(w) for w in EVERYDAY_WORDS))
+
+    @property
+    def signature(self) -> str:
+        h = hashlib.sha1(" ".join(sorted(self.everyday)).encode()).hexdigest()[:8]
+        return f"topic>={self.min_topic_words},{self.min_topic_ratio:g},{h}"
+
+
+@dataclass
+class Admission:
+    """How the known-word guard treats one question."""
+    status: str                      # "ok" (plain rule), "relaxed" (topic-word rule) or "blocked"
+    known: int                       # known content words
+    total: int                       # content words
+    topic_known: list[str] = field(default_factory=list)
+    topic_unknown: list[str] = field(default_factory=list)     # unknown words that carry topic
+    everyday_unknown: list[str] = field(default_factory=list)  # unknown everyday words (not counted)
+
+    @property
+    def passed(self) -> bool:
+        return self.status != "blocked"
+
+
 @dataclass
 class FitReport:
     n_docs: int = 0
@@ -75,6 +113,8 @@ class LSAEmbedder:
         self.total_energy: float = 0.0        # ||X||_F^2 of the training matrix
         self.report = FitReport()
         self._svd_mask: np.ndarray | None = None
+        self.policy: KnownWordPolicy | None = None   # query-time; set from [cache] (pipeline.configure_embedder)
+        self._everyday_keep: np.ndarray | None = None
 
     # ------------------------------------------------------------------ fitting
     def analyze(self, text: str) -> list[str]:
@@ -108,8 +148,7 @@ class LSAEmbedder:
             report.notes.append(f"left {int((~in_svd).sum())} latent stopwords out of the SVD fit: "
                                 + ", ".join(self.vocab.terms[i] for i in np.flatnonzero(~in_svd)))
         # LSA only merges related words when k is well below the number of documents.
-        cap = max(2, int(cfg.max_rank_fraction * X.shape[0]))
-        rank = max(1, min(cfg.rank, cap, X.shape[0] - 1, X.shape[1] - 1))
+        rank, cap = self.fit_rank(X.shape[0], X.shape[1])
         if rank < cfg.rank:
             reason = (f"max_rank_fraction = {cfg.max_rank_fraction} caps it at {cap}" if rank == cap
                       else "k must be smaller than both sides of the matrix")
@@ -141,6 +180,12 @@ class LSAEmbedder:
             print(f"  SVD done in {t2 - t1:.1f}s; top-{rank} directions keep "
                   f"{100 * report.energy_kept:.1f}% of the matrix energy")
         return self
+
+    def fit_rank(self, n_docs: int, n_terms: int) -> tuple[int, int]:
+        """(k the fit asks the SVD for, the max_rank_fraction cap) for an n_docs x n_terms matrix."""
+        cfg = self.config
+        cap = max(2, int(cfg.max_rank_fraction * n_docs))
+        return max(1, min(cfg.rank, cap, n_docs - 1, n_terms - 1)), cap
 
     # --------------------------------------------------------------- embedding
     @property
@@ -181,10 +226,27 @@ class LSAEmbedder:
         X = self.tfidf(texts)
         Z = la.l2_normalize_rows(la.project(X, self.V[:, :k], self.s[:k], self.config.sigma_power))
         if min_known_ratio > 0:
+            relaxed = []
             for i, text in enumerate(texts):
-                known, total = self.coverage(text)
-                if total == 0 or known / total < min_known_ratio:
+                status = self.admission(text, min_known_ratio).status
+                if status == "blocked":
                     Z[i] = 0.0
+                elif status == "relaxed":
+                    relaxed.append(i)
+            if relaxed:
+                # Match these on their known topic words alone: the everyday terms' columns are
+                # zeroed in the TF-IDF row (then re-normalised) before it is folded in.
+                X = sp.csr_matrix(X, copy=True)
+                keep = self.everyday_keep
+                for i in relaxed:
+                    a, b = X.indptr[i], X.indptr[i + 1]
+                    X.data[a:b] *= keep[X.indices[a:b]]
+                    norm = float(np.sqrt(X.data[a:b] @ X.data[a:b]))
+                    if norm > 0:
+                        X.data[a:b] /= norm
+                X.eliminate_zeros()
+                idx = np.array(relaxed)
+                Z[idx] = la.l2_normalize_rows(la.project(X[idx], self.V[:, :k], self.s[:k], self.config.sigma_power))
         return Z, X
 
     def encode_with_rho(self, texts: Sequence[str], min_known_ratio: float = 0.0
@@ -220,6 +282,44 @@ class LSAEmbedder:
         """Which of the text's terms the model knows (helps explain a miss)."""
         self._check()
         return self.vocab.known(self.analyze(text))
+
+    @property
+    def everyday_keep(self) -> np.ndarray:
+        """1.0 for every vocabulary term with no everyday word in it, 0.0 otherwise."""
+        everyday = self.policy.everyday if self.policy else frozenset()
+        if self._everyday_keep is None or self._everyday_keep.size != len(self.vocab):
+            self._everyday_keep = np.array([0.0 if any(w in everyday for w in t.split()) else 1.0
+                                            for t in self.vocab.terms])
+        return self._everyday_keep
+
+    @property
+    def policy_signature(self) -> str:
+        """Identifies the query-time policy; a cache built under another one is re-embedded."""
+        return self.policy.signature if self.policy else ""
+
+    def admission(self, text: str, min_known_ratio: float) -> Admission:
+        """The known-word guard for one question: "ok", "relaxed" (the topic-word rule of
+        ``self.policy``) or "blocked" (only an exact repeat can hit)."""
+        self._check()
+        words = tokenize(text, STOPWORDS, self.config.stem)
+        known = [w for w in words if w in self.vocab]
+        out = Admission("ok", len(known), len(words))
+        if min_known_ratio <= 0:
+            return out
+        if words and known and len(known) / len(words) >= min_known_ratio:
+            return out
+        out.status = "blocked"
+        if self.policy is not None:
+            every = self.policy.everyday
+            out.topic_known = [w for w in known if w not in every]
+            out.topic_unknown = [w for w in words if w not in self.vocab and w not in every]
+            out.everyday_unknown = [w for w in words if w not in self.vocab and w in every]
+            tk, tu = len(out.topic_known), len(out.topic_unknown)
+            if tk >= self.policy.min_topic_words and tk / (tk + tu) >= self.policy.min_topic_ratio:
+                out.status = "relaxed"
+        else:
+            out.topic_unknown = [w for w in words if w not in self.vocab]
+        return out
 
     def coverage(self, text: str) -> tuple[int, int]:
         """(known content words, total content words). If most words are unknown, the

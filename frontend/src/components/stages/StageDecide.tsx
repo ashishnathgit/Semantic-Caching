@@ -17,6 +17,10 @@ export function decide(x: Explanation, tau: number): { kind: VerdictKind; text: 
     return { kind: "BLOCKED", text: `Only ${x.coverage.known} of ${x.coverage.total} words are known (at least ${Math.round(x.coverage.min_ratio * 100)}% are needed), so only an exact repeat can hit.` };
   }
   if (x.verdict === "empty" || !best) return { kind: "MISS", text: "The cache is empty, so the model answers." };
+  // Only with cache.negation_guard on (never on the faq profile): the best match is refused.
+  if (x.refused && x.score >= tau) {
+    return { kind: "BLOCKED", text: `${x.score.toFixed(3)} ≥ τ ${tau.toFixed(2)}, but the negation guard refused it (${x.refused.rule}): ${x.refused.detail}. The model answers.` };
+  }
   const how = best.scored_by === "tfidf" ? " (scored by word overlap, TF-IDF)" : "";
   if (x.score >= tau) return { kind: "HIT", text: `${x.score.toFixed(3)} ≥ τ ${tau.toFixed(2)}${how}: the cached answer is reused, no model call.` };
   return { kind: "MISS", text: `${x.score.toFixed(3)} < τ ${tau.toFixed(2)}${how}, ${(tau - x.score).toFixed(3)} short: the model answers, and the answer is cached.` };

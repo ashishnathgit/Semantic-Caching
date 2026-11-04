@@ -11,7 +11,7 @@ Event fields
     source      "CACHE" | "LLM" | "FOLLOW-UP" | "FALLBACK" | "NONE" (model not called)
     llm         an LLM backend was called
     fallback    Ollama failed and the stub answered
-    backend     "ollama" | "stub" | None
+    backend     "ollama" | "openai_compatible" | "stub" | None (the backend that answered)
     total_ms, llm_ms
     prompt_tokens, output_tokens       reported by Ollama (None otherwise)
     entry_tokens                       for a hit: the tokens the cached answer cost when it
@@ -188,6 +188,9 @@ class MetricsStore:
             "tokens": {"input": tokens_in, "output": tokens_out, "calls_with_counts": len(counted),
                        "avg_input_per_call": avg_in, "avg_output_per_call": avg_out},
             "first_event": ev[0]["t"] if ev else None,
+            # which backend answered the LLM calls (Ollama, an online model, the placeholder)
+            "by_backend": {b: sum(e.get("backend") == b for e in llm)
+                           for b in sorted({e.get("backend") or "unknown" for e in llm})},
         }
         out["cost"] = self._cost(pricing, real_llm, hits, avg_in, avg_out) if pricing.configured else None
         return out

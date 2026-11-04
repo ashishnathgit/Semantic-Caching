@@ -31,3 +31,4 @@ docs/screenshots/*/frames/
 *.zip
 .env
 .env.*
+!.env.example

@@ -32,8 +32,10 @@ def load_demo_script(settings: Settings) -> list[dict]:
 
 
 def _ollama(backend) -> OllamaBackend | None:
-    inner = getattr(backend, "primary", backend)
-    return inner if isinstance(inner, OllamaBackend) else None
+    for inner in getattr(backend, "backends", None) or [getattr(backend, "primary", backend)]:
+        if isinstance(inner, OllamaBackend):
+            return inner
+    return None
 
 
 def run_preflight(settings: Settings, out: Callable[[str], None] = print,
@@ -95,8 +97,8 @@ def run_preflight(settings: Settings, out: Callable[[str], None] = print,
             got, detail = ("follow-up" if f.is_follow_up else "standalone"), f.reason or "no follow-up signal"
         else:
             r = look(shadow if step.get("after") else service.cache, q)
-            known, total = service.embedder.coverage(q)
-            blocked = total == 0 or known == 0 or known / total < ratio
+            adm = service.embedder.admission(q, ratio)
+            blocked = adm.total == 0 or adm.known == 0 or not adm.passed
             got = "hit" if r.hit else "blocked" if blocked else "miss"
             best = r.matches[0] if r.matches else None
             detail = f"{r.score:.3f}" + (f" vs “{best.entry.query}”" if best else "")

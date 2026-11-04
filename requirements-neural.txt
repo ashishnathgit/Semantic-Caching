@@ -1,0 +1,9 @@
+# Optional: the neural baseline (MiniLM) used only by `python -m semcache measure --only neural`.
+# Nothing else in the project imports these; the cache itself stays pure linear algebra.
+#   pip install -r requirements-neural.txt
+sentence-transformers==6.2.0
+transformers==5.22.1
+torch==2.15.0
+# Resolved alongside them in our install (Python 3.12, macOS arm64): tokenizers==0.23.3,
+# safetensors==0.8.0, scikit-learn==1.9.1. The model sentence-transformers/all-MiniLM-L6-v2
+# (~90 MB) is downloaded from Hugging Face on first use.

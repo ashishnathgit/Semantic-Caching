@@ -4,12 +4,20 @@ import type {
   Explanation,
   Metrics,
   Health,
+  ImportResult,
+  LabCorrectness,
+  LabLatencyPoint,
+  LabOps,
+  LabRefit,
+  LabWorked,
   LookupResult,
   ModelInfo,
+  ModelStatus,
   Profile,
   ResetResult,
   ThreadDetail,
   ThreadSummary,
+  WrongAnswerResult,
 } from "./types";
 
 // Same-origin "/api": in development Vite proxies it to http://127.0.0.1:8000,
@@ -89,8 +97,25 @@ export const api = {
   resetDemo: () => request<{ entries: number }>("/reset-demo", { method: "POST" }),
 
   entries: (limit = 200) => request<CacheEntry[]>(`/entries?limit=${limit}`),
-  addEntry: (question: string, answer: string, shared = false) =>
-    request<CacheEntry>("/entries", post({ question, answer, shared })),
+  addEntry: (question: string, answer: string, shared = false, ttlSeconds: number | null = null) =>
+    request<CacheEntry>("/entries", post({ question, answer, shared, ...(ttlSeconds !== null ? { ttl_seconds: ttlSeconds } : {}) })),
+  importCsv: (profile: string, csv: string) => request<ImportResult>("/admin/import-csv", post({ profile, csv })),
+  deleteEntries: (ids: number[]) =>
+    request<{ removed: number; missing: number[]; entries: number }>("/admin/entries/delete", post({ ids })),
+  forgetLlm: () => request<{ removed: number; entries: number }>("/admin/forget-llm", { method: "POST" }),
+  wrongAnswer: (query: string, entryId: number) =>
+    request<WrongAnswerResult>("/feedback/wrong", post({ query, entry_id: entryId })),
   deleteEntry: (id: number) => request<{ deleted: number }>(`/entries/${id}`, { method: "DELETE" }),
   reset: () => request<ResetResult>("/reset", { method: "POST" }),
+
+  modelStatus: () => request<ModelStatus>("/model/status"),
+  rebuildModel: () => request<ModelStatus>("/admin/rebuild", { method: "POST" }),
+
+  // Matrix Lab: none of these change the served model
+  labCorrectness: () => request<LabCorrectness>("/lab/correctness"),
+  labWorked: (query: string, threshold: number, signal?: AbortSignal) =>
+    request<LabWorked>("/lab/worked", post({ query, threshold }), signal),
+  labOps: (query: string, signal?: AbortSignal) => request<LabOps>("/lab/ops", post({ query }), signal),
+  labRefit: (k: number, query: string | null) => request<LabRefit>("/lab/refit", post({ k, query })),
+  labLatency: (limit = 500) => request<{ points: LabLatencyPoint[] }>(`/lab/latency?limit=${limit}`),
 };

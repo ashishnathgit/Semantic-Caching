@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, setApiAdminKey, setApiUser } from "./api";
+import { AdminTools } from "./components/AdminTools";
 import { AnswerCard } from "./components/AnswerCard";
 import { CachePanel } from "./components/CachePanel";
 import { Conversation } from "./components/Conversation";
+import { MatrixLab } from "./components/lab/MatrixLab";
 import { LiveMathPanel, STAGE_MS } from "./components/LiveMathPanel";
 import { ModelPanel } from "./components/ModelPanel";
 import { PerformanceChart } from "./components/PerformanceChart";
@@ -83,6 +85,7 @@ export default function App() {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [scope, setScope] = useState<"global" | "user">("global");
   const [present, setPresent] = useState(false);
+  const [tab, setTab] = useState<"cache" | "lab">("cache");
 
   // ------------------------------------------------------------------ data
   const refresh = useCallback(async () => {
@@ -390,8 +393,10 @@ export default function App() {
                   : warming
                     ? <span className="animate-pulse">Model warming up…</span>
                     : backend?.available
-                      ? `Ollama · ${backend.model}`
-                      : "Ollama off: placeholder answers"}
+                      ? `${backend.backend === "openai_compatible" ? "Online" : "Ollama"} · ${backend.model}${backend.chain ? ` (chain: ${backend.chain.join(" → ")})` : ""}`
+                      : backend?.backend === "openai_compatible"
+                        ? "Online model not configured"
+                        : "Ollama off: placeholder answers"}
               </span>
             )}
             {user && (
@@ -438,6 +443,19 @@ export default function App() {
             </div>
           ) : (
           <>
+            {/* A radio group, not role=tab: the stage player owns the page's tabs (scripts/screenshots.mjs). */}
+            <div role="radiogroup" aria-label="View" className="hide-in-present mb-6 flex w-fit rounded-xl bg-sheet p-1 shadow-[var(--shadow-card)]">
+              {([["cache", "Cache"], ["lab", "Matrix Lab"]] as const).map(([id, label]) => (
+                <button key={id} type="button" role="radio" aria-checked={tab === id} data-view={id} onClick={() => setTab(id)}
+                  className={`rounded-lg px-4 py-1.5 text-[15px] font-medium ${tab === id ? "bg-ink text-sheet" : "text-ink-soft hover:text-ink"}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            {tab === "lab" ? (
+              <MatrixLab tau={tau} initialQuestion={result?.query ?? query} />
+            ) : (
+            <>
             <main className="grid items-start gap-6 xl:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
               <div className="min-w-0 space-y-4">
                 <QuestionBox
@@ -454,7 +472,13 @@ export default function App() {
                   followUpHint={followUpHint}
                   hasThread={Boolean(thread?.messages.length)}
                 />
-                <AnswerCard result={result} pending={pendingQuestion} error={askError} />
+                <AnswerCard result={result} pending={pendingQuestion} error={askError}
+                  onWrong={async (r) => {
+                    const out = await api.wrongAnswer(r.query, r.matched_id as number);
+                    await refresh();
+                    setCacheVersion((v) => v + 1);
+                    return out.note;
+                  }} />
                 <section className="card space-y-3 p-5">
                   <ThreadPicker
                     threads={threads}
@@ -498,13 +522,18 @@ export default function App() {
                   entries={entries}
                   user={user.name}
                   isAdmin={user.is_admin}
-                  onAdd={async (q, a, shared) => {
-                    await api.addEntry(q, a, shared);
+                  onAdd={async (q, a, shared, ttl) => {
+                    await api.addEntry(q, a, shared, ttl);
                     await refresh();
                     setCacheVersion((v) => v + 1);
                   }}
                   onDelete={async (id) => {
                     await api.deleteEntry(id);
+                    await refresh();
+                    setCacheVersion((v) => v + 1);
+                  }}
+                  onDeleteMany={async (ids) => {
+                    await api.deleteEntries(ids);
                     await refresh();
                     setCacheVersion((v) => v + 1);
                   }}
@@ -527,11 +556,20 @@ export default function App() {
                   }}
                 />
               </section>
+              {user.is_admin && (
+                <AdminTools onChanged={async () => {
+                  await refresh();
+                  api.model().then(setModel).catch(() => undefined);
+                  setCacheVersion((v) => v + 1);
+                }} />
+              )}
               <section className="card p-5">
                 <h2 className="mt-0 mb-4 text-[22px] font-semibold tracking-tight">What the SVD learned</h2>
                 <ModelPanel model={model} />
               </section>
             </div>
+            </>
+            )}
           </>
           )
         )}

@@ -42,22 +42,37 @@ class CorpusConfig:
     quora_max_questions: int = 100000
     require_quora: bool = False      # fail the build instead of falling back to the FAQ only
     seed: int = 42
+    include_cached: bool = False     # also fit on every shared cached question joined with its answer
 
 
 @dataclass
 class CacheConfig:
     threshold: float = 0.70
     min_known_ratio: float = 0.5
+    # Topic-word rule (embedder.KnownWordPolicy): a question failing min_known_ratio still gets a
+    # semantic match, on its known topic words alone, when unknown everyday words are not counted
+    # and it has >= min_topic_words known topic words making up >= min_topic_ratio of them.
+    relaxed_known_words: bool = True
+    min_topic_words: int = 2
+    min_topic_ratio: float = 0.4
     lsa_weight: float = 1.0
     min_latent_coverage: float = 0.30   # pairs with a smaller rho are scored by word overlap only
     max_entries: int = 5000
     top_k: int = 5
     use_lsh: bool = False
-    lsh_bits: int = 12
-    lsh_tables: int = 8
-    lsh_min_entries: int = 1000
+    lsh_bits: int = 10               # b and L from `measure` (LSH sweep): recall >= 0.95 at 10k and 50k
+    lsh_tables: int = 24
+    lsh_min_entries: int = 50000     # below this, one brute-force product C e is as fast as LSH
     autosave_every: int = 10
     warm_with_faq: bool = True
+    ttl_seconds: float = 0.0           # default lifetime of a new entry; 0 = never expires (off)
+    per_entry_thresholds: bool = False # experimental: each entry learns its own tau from feedback
+    entry_precision_target: float = 0.95
+    rebuild_every: int = 0             # with corpus.include_cached: refit after this many new entries (0 = never)
+    negation_guard: bool = False       # refuse a semantic hit whose negation / antonym / number / name differs
+    antonyms: list[str] = field(default_factory=lambda: [
+        "on/off", "enable/disable", "increase/decrease", "allow/block", "include/exclude",
+        "before/after", "true/false"])
 
 
 @dataclass
@@ -71,6 +86,17 @@ class LLMConfig:
     system_prompt: str = "Answer clearly and concisely in 2-4 sentences."
     cache_stub_answers: bool = True     # only when backend = "stub"; fallback answers are never cached
     stub_delay_ms: float = 0.0
+    # Online model (backend or chain entry "openai_compatible"). The base URL, model and key come from
+    # .env (SEMCACHE_OPENAI_BASE_URL, SEMCACHE_OPENAI_MODEL, SEMCACHE_OPENAI_API_KEY); the two below are
+    # defaults when .env doesn't set them. The key is only read from the environment, never from here.
+    openai_base_url: str = ""
+    openai_model: str = ""
+    openai_api_key_env: str = "SEMCACHE_OPENAI_API_KEY"
+    openai_max_tokens: int | None = None
+    chain: list[str] = field(default_factory=list)   # e.g. ["openai_compatible", "ollama", "stub"]; empty =
+                                                     # backend (+ the stub when fallback_to_stub)
+    model_params_billion: float | None = None   # for the Matrix Lab's FLOP estimate; None = read the
+                                                # size from the model tag ("llama3.2:3b" -> 3)
 
 
 @dataclass
@@ -107,12 +133,62 @@ class EvalConfig:
     cache_sim_pairs: int = 5000
     latency_sizes: list[int] = field(default_factory=lambda: [1000, 5000, 20000, 50000])
     seed: int = 7
+    # `measure` traffic-mix simulation (measurement only; nothing here changes behaviour)
+    traffic_mix: list[float] = field(default_factory=lambda: [0.18, 0.47, 0.35])  # exact, reworded, new
+    traffic_queries: int = 10000
+    traffic_cached_share: float = 0.65       # share of FAQ items in the simulated cache
+    llm_usd_per_call: float = 0.001          # assumed price of one LLM call (an estimate)
+    cpu_usd_per_hour: float = 0.05           # assumed price of one CPU core-hour, prices a lookup
 
 
 ADMIN_KEY_ENV = "SEMCACHE_ADMIN_KEY"
 PROFILE_ENV = "SEMCACHE_PROFILE"
 BACKEND_ENV = "SEMCACHE_LLM_BACKEND"     # overrides [llm] backend, e.g. "stub" if Ollama fails on stage
 DEFAULT_PROFILE = "faq"
+
+
+def load_env_file(path: Path) -> list[str]:
+    """Read KEY=value lines from a .env file into os.environ (variables already set win).
+    Returns the names it set. Values are never printed or logged."""
+    if not path.is_file():
+        return []
+    names = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.removeprefix("export ").partition("=")
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+            names.append(key)
+    return names
+
+
+IMPORTED_PROFILE_FILE = "profile.toml"
+
+
+def valid_profile_name(name: str) -> bool:
+    return bool(name) and len(name) <= 40 and name.replace("_", "").replace("-", "").isalnum()
+
+
+def imported_profiles(artifacts_root: Path, exclude: set[str] = frozenset()) -> dict[str, dict]:
+    """{name: override table} for every artifacts/<name>/profile.toml (made by import_faq_csv)."""
+    out: dict[str, dict] = {}
+    if not artifacts_root.is_dir():
+        return out
+    for path in sorted(artifacts_root.glob(f"*/{IMPORTED_PROFILE_FILE}")):
+        name = path.parent.name
+        if name in exclude or not valid_profile_name(name):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                out[name] = tomllib.load(fh)
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+    return out
 
 
 @dataclass
@@ -171,26 +247,38 @@ class Settings:
     def load(cls, path: str | Path | None = None, profile: str | None = None) -> "Settings":
         path = Path(path or os.environ.get("SEMCACHE_CONFIG") or PROJECT_ROOT / "config.toml")
         settings = cls(root=path.resolve().parent if path.exists() else PROJECT_ROOT)
+        load_env_file(settings.root / ".env")
         raw: dict = {}
         if path.exists():
             with open(path, "rb") as fh:
                 raw = tomllib.load(fh)
         profiles = dict(raw.get("profiles", {}))
         default = profiles.pop("default", DEFAULT_PROFILE)
-        settings.profiles = sorted(name for name, table in profiles.items() if isinstance(table, dict))
+        configured = sorted(name for name, table in profiles.items() if isinstance(table, dict))
+        # Profiles created by "Import FAQ CSV" live in artifacts/<name>/profile.toml, never in config.toml.
+        settings.paths.artifacts_dir = raw.get("paths", {}).get("artifacts_dir", settings.paths.artifacts_dir)
+        imported = imported_profiles(settings.artifacts_root, exclude=set(configured))
+        settings.profiles = sorted(set(configured) | set(imported))
         name = (profile or os.environ.get(PROFILE_ENV) or default).strip().lower()
         if settings.profiles and name not in settings.profiles:
-            raise ValueError(f"unknown profile {name!r}; config.toml defines {', '.join(settings.profiles)}")
-        if not name.replace("_", "").replace("-", "").isalnum():
+            raise ValueError(f"unknown profile {name!r}; config.toml defines {', '.join(configured)}"
+                             + (f" and these were imported: {', '.join(sorted(imported))}" if imported else ""))
+        if not valid_profile_name(name):
             raise ValueError(f"profile names may only use letters, digits, '-' and '_': {name!r}")
+        if name in imported:
+            profiles[name] = imported[name]
         settings.profile = name
         settings._apply(raw, "config.toml")
         settings._apply(profiles.get(name, {}), f"config.toml [profiles.{name}]")
         backend = os.environ.get(BACKEND_ENV, "").strip().lower()
         if backend:
-            if backend not in ("ollama", "stub"):
-                raise ValueError(f"{BACKEND_ENV} must be ollama or stub, not {backend!r}")
+            if backend not in ("ollama", "stub", "openai_compatible"):
+                raise ValueError(f"{BACKEND_ENV} must be ollama, openai_compatible or stub, not {backend!r}")
             settings.llm.backend = backend
+            settings.llm.chain = []                # an explicit override beats the chain
+        for name in settings.llm.chain:
+            if name not in ("ollama", "stub", "openai_compatible"):
+                raise ValueError(f"[llm] chain: unknown backend {name!r}")
         return settings
 
     def _apply(self, raw: dict, where: str) -> None:

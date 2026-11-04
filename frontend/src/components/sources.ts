@@ -9,6 +9,8 @@ export function sourceLabel(source: string): string {
       return "Placeholder";
     case "manual":
       return "Added by hand";
+    case "openai_compatible":
+      return "Online model";
     default:
       return source;
   }
@@ -25,4 +27,8 @@ export function formatMs(ms: number): string {
   if (ms < 100) return `${ms.toFixed(1)} ms`;
   if (ms < 10000) return `${Math.round(ms).toLocaleString()} ms`;
   return `${(ms / 1000).toFixed(1)} s`;
+}
+
+export function backendLabel(backend: string): string {
+  return { ollama: "Ollama", openai_compatible: "online model", stub: "placeholder" }[backend] ?? backend;
 }

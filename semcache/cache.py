@@ -5,7 +5,7 @@ so a lookup is a single matrix-vector product (linalg.cosine_scores):
 
     scores = C q,     hit  <=>  max(scores) >= tau
 
-Four refinements, each optional:
+Five refinements, each optional:
 
 * Exact layer. A dictionary keyed by the normalised query text answers exact
   repeats instantly, even when their words are unknown to the model (such
@@ -17,8 +17,12 @@ Four refinements, each optional:
   question) pair is below ``min_latent_coverage``, their latent cosine means little
   (both may have collapsed onto "what" or "how"), so that pair is scored by word
   overlap alone, the TF-IDF cosine (linalg.guarded_scores).
+* Negation guard. With ``negation_guard=True`` a semantic hit is refused when the
+  question and the cached question differ in negation, an antonym, a number or a name
+  (semcache/guards.py); the lookup becomes a miss and ``refused`` names the rule.
 * LSH. With ``use_lsh=True`` only rows sharing an LSH bucket with q are scored
-  (linalg.RandomHyperplaneLSH), which keeps lookups fast for large caches.
+  (linalg.RandomHyperplaneLSH), which keeps lookups fast for large caches. The LSH
+  tables are keyed by row position in C (not entry id), so candidates index C directly.
 
 Several users share one cache. An entry with ``owner=None`` is shared (FAQ
 answers and LLM answers to standalone questions); an entry with an owner is
@@ -74,6 +78,9 @@ class CacheEntry:
     asked_by: str | None = None      # who asked the question a shared LLM answer was made for
     prompt_tokens: int | None = None # tokens the LLM call that made the answer used (if reported)
     output_tokens: int | None = None
+    expires_at: float | None = None  # unix time after which the entry is a miss (None = never)
+    threshold: float | None = None   # own tau (per_entry_thresholds; None = the global tau)
+    feedback: list | None = None     # recent [score, correct 0/1] observations behind ``threshold``
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -115,6 +122,8 @@ class LookupResult:
     compared: int = 0                # how many cached vectors were scored
     method: str = "brute"            # "exact", "brute", "lsh" or "empty"
     rho: float = 1.0                 # latent coverage of the question
+    refused: dict | None = None      # the text guard refused the best match: {rule, detail, ...}
+    threshold_used: float | None = None  # the best entry's own tau when per-entry thresholds raised it
 
 
 ALL_USERS = object()
@@ -123,9 +132,12 @@ ALL_USERS = object()
 
 class SemanticCache:
     def __init__(self, dim: int, threshold: float = 0.8, max_entries: int = 5000,
-                 use_lsh: bool = False, lsh_bits: int = 12, lsh_tables: int = 8,
-                 lsh_min_entries: int = 1000, seed: int = 0, model_fingerprint: str = "",
-                 lsa_weight: float = 1.0, min_latent_coverage: float = 0.0):
+                 use_lsh: bool = False, lsh_bits: int = 10, lsh_tables: int = 24,
+                 lsh_min_entries: int = 50000, seed: int = 0, model_fingerprint: str = "",
+                 lsa_weight: float = 1.0, min_latent_coverage: float = 0.0,
+                 negation_guard: bool = False, antonyms: list[str] | None = None,
+                 ttl_seconds: float = 0.0, per_entry_thresholds: bool = False,
+                 entry_precision_target: float = 0.95, query_policy: str = ""):
         if not 0.0 < threshold <= 1.0:
             raise ValueError("threshold must be in (0, 1]")
         if not 0.0 <= lsa_weight <= 1.0:
@@ -134,16 +146,27 @@ class SemanticCache:
         self.threshold = threshold
         self.max_entries = max_entries
         self.model_fingerprint = model_fingerprint
+        self.query_policy = query_policy        # the embedder's known-word policy the vectors were made under
         self.lsa_weight = lsa_weight
         self.min_latent_coverage = float(min_latent_coverage)
         self.lsh_settings = {"n_bits": lsh_bits, "n_tables": lsh_tables, "seed": seed}
         self.lsh_min_entries = lsh_min_entries
+        self.ttl_seconds = float(ttl_seconds or 0.0)      # default lifetime of new entries; 0 = forever
+        self.per_entry_thresholds = bool(per_entry_thresholds)   # experimental (semcache/thresholds.py)
+        self.entry_precision_target = float(entry_precision_target)
         self.lsh = la.RandomHyperplaneLSH(dim, lsh_bits, lsh_tables, seed) if use_lsh else None
+        # Text rules checked before a semantic hit is served (semcache/guards.py); None = off.
+        self.text_guard = None
+        if negation_guard:
+            from .guards import TextGuard
+            self.text_guard = TextGuard(antonyms or [])
 
         capacity = 64
         self._vectors = np.zeros((capacity, dim))
         self._last_used = np.zeros(capacity)
         self._rho = np.ones(capacity)              # latent coverage of each cached question
+        self._expires = np.full(capacity, np.inf)  # expiry time of each row (inf = never)
+        self._n_expiring = 0                       # rows with a finite expiry; 0 = no mask needed
         self._tfidf_matrix: sp.csr_matrix | None = None   # rows of _tfidf, built on demand
         self._owner_codes = np.zeros(capacity, dtype=np.int32)   # 0 = shared, else _owner_code[owner]
         self._owner_code: dict[str, int] = {}
@@ -176,14 +199,22 @@ class SemanticCache:
         slot = self._slot_of.get(entry_id)
         return None if slot is None else self._entries[slot]
 
-    def find_exact(self, query: str, user: str | None = None) -> CacheEntry | None:
+    def find_exact(self, query: str, user: str | None = None, include_expired: bool = False) -> CacheEntry | None:
         """The entry ``user`` would get for exactly this question (case, spacing and
-        punctuation ignored): their own private entry first, else the shared one."""
+        punctuation ignored): their own private entry first, else the shared one.
+        Expired entries are skipped unless ``include_expired``."""
         key = exact_key(query)
-        entry_id = self._exact.get((user, key)) if user is not None else None
-        if entry_id is None:
-            entry_id = self._exact.get((None, key))
-        return None if entry_id is None else self.get(entry_id)
+        now = time.time()
+        for owner in ((user, None) if user is not None else (None,)):
+            entry_id = self._exact.get((owner, key))
+            entry = None if entry_id is None else self.get(entry_id)
+            if entry is not None and (include_expired or not self.expired(entry, now)):
+                return entry
+        return None
+
+    @staticmethod
+    def expired(entry: CacheEntry, now: float | None = None) -> bool:
+        return entry.expires_at is not None and entry.expires_at <= (time.time() if now is None else now)
 
     def entries(self, newest_first: bool = True, user=ALL_USERS) -> list[CacheEntry]:
         """Entries sorted by creation time. ``user`` limits them to what that user can see
@@ -196,12 +227,17 @@ class SemanticCache:
         return entry.owner is None or entry.owner == user
 
     def _visible_mask(self, user: str | None) -> np.ndarray | None:
-        """Boolean mask over the slots ``user`` may see, or None when they may see all."""
-        if self._n_private == 0:
-            return None
-        codes = self._owner_codes[: len(self)]
-        code = self._owner_code.get(user) if user is not None else None
-        return (codes == 0) if code is None else ((codes == 0) | (codes == code))
+        """Boolean mask over the slots ``user`` may see (and that have not expired), or None
+        when every slot counts. O(n) only when there are private or expiring entries."""
+        mask = None
+        if self._n_private:
+            codes = self._owner_codes[: len(self)]
+            code = self._owner_code.get(user) if user is not None else None
+            mask = (codes == 0) if code is None else ((codes == 0) | (codes == code))
+        if self._n_expiring:
+            alive = self._expires[: len(self)] > time.time()
+            mask = alive if mask is None else (mask & alive)
+        return mask
 
     # ------------------------------------------------------------------ lookup
     def lookup(self, vector: np.ndarray, top_k: int = 5, threshold: float | None = None,
@@ -226,8 +262,8 @@ class SemanticCache:
         blocked_query = query_rho < self.min_latent_coverage and query_tfidf is not None
         if n and np.any(q):
             if self.lsh is not None and n >= self.lsh_min_entries and not blocked_query:
-                candidate_ids = self.lsh.candidates(q)
-                slots = np.array([self._slot_of[i] for i in candidate_ids], dtype=np.intp)
+                # The LSH tables store row positions of C, so no per-candidate id lookup.
+                slots = self.lsh.candidates(q).astype(np.intp)
                 method = "lsh"
             else:
                 slots = np.arange(n)
@@ -243,6 +279,7 @@ class SemanticCache:
                 matches = self._score(slots, rows, q, top_k, query_tfidf, visible, query_rho)
             compared = int(slots.size if visible is None else visible.sum())
 
+        refused = threshold_used = None
         exact_entry = self.find_exact(query_text, user) if query_text is not None else None
         if exact_entry is not None:
             exact_match = Match(exact_entry, 1.0, rho=self.rho_of(exact_entry.id),
@@ -252,7 +289,15 @@ class SemanticCache:
             best, hit, method = matches[0], True, "exact"
         elif matches:
             best = matches[0]
-            hit = best.score >= tau
+            own = best.entry.threshold if self.per_entry_thresholds else None
+            if own is not None and own > tau:
+                threshold_used = own
+            hit = best.score >= max(tau, own or 0.0)
+            if hit and self.text_guard is not None and query_text is not None:
+                refused = self.text_guard.check(query_text, best.entry.query)
+                if refused is not None:
+                    hit = False
+                    refused = {**refused, "entry_id": best.entry.id, "score": round(best.score, 4)}
         else:
             if record:
                 self.misses += 1
@@ -267,7 +312,7 @@ class SemanticCache:
             else:
                 self.misses += 1
         return LookupResult(hit, best.score, tau, best.entry if hit else None, matches,
-                            compared, method, query_rho)
+                            compared, method, query_rho, refused, threshold_used)
 
     def _score(self, slots: np.ndarray, rows: np.ndarray, q: np.ndarray, top_k: int,
                query_tfidf, visible: np.ndarray | None = None, query_rho: float = 1.0) -> list[Match]:
@@ -347,9 +392,10 @@ class SemanticCache:
     def add(self, query: str, answer: str, vector: np.ndarray, source: str = "manual",
             model: str | None = None, tfidf_row=None, owner: str | None = None,
             rho: float = 1.0, asked_by: str | None = None, prompt_tokens: int | None = None,
-            output_tokens: int | None = None) -> CacheEntry:
+            output_tokens: int | None = None, ttl_seconds: float | None = None) -> CacheEntry:
         """Store an answer. ``owner=None`` shares it with everyone; otherwise only that
-        user's lookups can see it. ``rho`` is the question's latent coverage."""
+        user's lookups can see it. ``rho`` is the question's latent coverage. ``ttl_seconds``
+        (default: the cache's ``ttl_seconds``; 0 = never) makes it expire: then it is a miss."""
         vector = la.l2_normalize_rows(np.asarray(vector, dtype=np.float64))
         if vector.shape != (self.dim,):
             raise ValueError(f"vector must have shape ({self.dim},), got {vector.shape}")
@@ -362,13 +408,16 @@ class SemanticCache:
             self._grow()
 
         now = time.time()
+        ttl = self.ttl_seconds if ttl_seconds is None else float(ttl_seconds)
         entry = CacheEntry(self._next_id, query, answer, source, now, now, model=model, owner=owner,
-                           asked_by=asked_by, prompt_tokens=prompt_tokens, output_tokens=output_tokens)
+                           asked_by=asked_by, prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+                           expires_at=now + ttl if ttl > 0 else None)
         self._next_id += 1
         slot = len(self)
         self._vectors[slot] = vector
         self._last_used[slot] = now
         self._rho[slot] = float(rho)
+        self._set_expiry(slot, entry.expires_at)
         self._tfidf_matrix = None
         self._set_owner(slot, owner)
         self._entries.append(entry)
@@ -377,7 +426,7 @@ class SemanticCache:
         if key:
             self._exact[(owner, key)] = entry.id
         if self.lsh is not None:
-            self.lsh.add([entry.id], vector[None, :])
+            self.lsh.add([slot], vector[None, :])
         return entry
 
     def add_many(self, items: Iterable[tuple[str, str]], vectors: np.ndarray,
@@ -386,6 +435,10 @@ class SemanticCache:
         rhos = np.ones(len(vectors)) if rhos is None else rhos
         return [self.add(q, a, v, source, tfidf_row=r, rho=float(p))
                 for (q, a), v, r, p in zip(items, vectors, rows, rhos)]
+
+    def _set_expiry(self, slot: int, expires_at: float | None) -> None:
+        self._expires[slot] = np.inf if expires_at is None else float(expires_at)
+        self._n_expiring += expires_at is not None
 
     def _set_owner(self, slot: int, owner: str | None) -> None:
         if owner is None:
@@ -405,7 +458,10 @@ class SemanticCache:
         owner_codes[: len(self)] = self._owner_codes[: len(self)]
         rho = np.ones(capacity)
         rho[: len(self)] = self._rho[: len(self)]
+        expires = np.full(capacity, np.inf)
+        expires[: len(self)] = self._expires[: len(self)]
         self._vectors, self._last_used, self._owner_codes, self._rho = vectors, last_used, owner_codes, rho
+        self._expires = expires
 
     # ---------------------------------------------------------------- removal
     def remove(self, entry_id: int) -> bool:
@@ -420,8 +476,12 @@ class SemanticCache:
             del self._exact[key]
         if entry.owner is not None:
             self._n_private -= 1
+        if entry.expires_at is not None:
+            self._n_expiring -= 1
         if self.lsh is not None:
-            self.lsh.remove(entry_id)
+            self.lsh.remove(slot)
+            if slot != last:
+                self.lsh.rename(last, slot)          # the last row moves into the freed slot
         if slot != last:
             moved = self._entries[last]
             self._entries[slot] = moved
@@ -430,14 +490,37 @@ class SemanticCache:
             self._last_used[slot] = self._last_used[last]
             self._owner_codes[slot] = self._owner_codes[last]
             self._rho[slot] = self._rho[last]
+            self._expires[slot] = self._expires[last]
             self._slot_of[moved.id] = slot
         self._entries.pop()
         self._tfidf.pop()
         self._vectors[last] = 0.0
         self._owner_codes[last] = 0
         self._rho[last] = 1.0
+        self._expires[last] = np.inf
         self._tfidf_matrix = None
         return True
+
+    def observe(self, entry_id: int, score: float, correct: bool, replace_positive: bool = False) -> float | None:
+        """Per-entry thresholds: record one (score, correct?) observation; returns the entry's tau."""
+        from .thresholds import add_observation
+        entry = self.get(entry_id)
+        if entry is None:
+            return None
+        return add_observation(entry, score, correct, self.threshold, self.entry_precision_target, replace_positive)
+
+    def remove_where(self, predicate) -> int:
+        """Delete every entry for which ``predicate(entry)`` is true; returns how many."""
+        ids = [e.id for e in self._entries if predicate(e)]
+        for entry_id in ids:
+            self.remove(entry_id)
+        return len(ids)
+
+    def purge_expired(self) -> int:
+        if not self._n_expiring:
+            return 0
+        now = time.time()
+        return self.remove_where(lambda e: self.expired(e, now))
 
     def remove_owned_by(self, owner: str) -> int:
         """Delete every private entry of ``owner``; returns how many were removed."""
@@ -460,6 +543,8 @@ class SemanticCache:
         self._last_used[:] = 0.0
         self._owner_codes[:] = 0
         self._rho[:] = 1.0
+        self._expires[:] = np.inf
+        self._n_expiring = 0
         self._tfidf_matrix = None
         self._owner_code.clear()
         self._n_private = 0
@@ -468,12 +553,28 @@ class SemanticCache:
         self.hits = self.misses = self.evictions = 0
 
     # -------------------------------------------------------------- utilities
-    def reembed(self, embedder: "LSAEmbedder", min_known_ratio: float = 0.0) -> None:
-        """Recompute every vector with a new embedder (e.g. after refitting the SVD)."""
+    def reembed(self, embedder: "LSAEmbedder", min_known_ratio: float = 0.0,
+                precomputed: dict | None = None) -> int:
+        """Recompute every vector with a new embedder (e.g. after refitting the SVD).
+
+        ``precomputed`` maps entry id -> (vector, sparse TF-IDF row, rho) already computed
+        with ``embedder`` (a background rebuild does that outside the lock); only the
+        entries missing from it are encoded here. Returns how many were encoded here."""
         self.dim = embedder.dim
+        precomputed = precomputed or {}
+        missing = [i for i, e in enumerate(self._entries) if e.id not in precomputed]
         if self._entries:
-            vectors, X, rho = embedder.encode_with_rho([e.query for e in self._entries], min_known_ratio)
-            rows = [as_sparse_row(X[i]) if np.any(vectors[i]) else _EMPTY_ROW for i in range(len(self))]
+            vectors = np.zeros((len(self), self.dim))
+            rho = np.ones(len(self))
+            rows: list[SparseRow] = [_EMPTY_ROW] * len(self)
+            for i, e in enumerate(self._entries):
+                if e.id in precomputed:
+                    vectors[i], rows[i], rho[i] = precomputed[e.id]
+            if missing:
+                V, X, r = embedder.encode_with_rho([self._entries[i].query for i in missing], min_known_ratio)
+                for j, i in enumerate(missing):
+                    vectors[i], rows[i], rho[i] = V[j], as_sparse_row(X[j]), r[j]
+            rows = [row if np.any(vectors[i]) else _EMPTY_ROW for i, row in enumerate(rows)]
         else:
             vectors, rows, rho = np.zeros((0, self.dim)), [], np.zeros(0)
         capacity = max(64, self._vectors.shape[0])
@@ -484,10 +585,12 @@ class SemanticCache:
         self._tfidf = rows
         self._tfidf_matrix = None
         self.model_fingerprint = embedder.fingerprint
+        self.query_policy = embedder.policy_signature
         if self.lsh is not None:
             s = self.lsh_settings
             self.lsh = la.RandomHyperplaneLSH(self.dim, s["n_bits"], s["n_tables"], s["seed"])
-            self.lsh.add([e.id for e in self._entries], vectors)
+            self.lsh.add(range(len(self)), vectors)
+        return len(missing)
 
     def stats(self) -> dict:
         total = self.hits + self.misses
@@ -507,6 +610,8 @@ class SemanticCache:
             "lsa_weight": self.lsa_weight,
             "min_latent_coverage": self.min_latent_coverage,
             "lsh": self.lsh is not None,
+            "expiring_entries": self._n_expiring,
+            "ttl_seconds": self.ttl_seconds,
             "by_source": by_source,
             "memory_bytes": int(len(self) * self.dim * 8 + sum(i.nbytes + v.nbytes for i, v in self._tfidf)),
         }
@@ -529,6 +634,7 @@ class SemanticCache:
             "threshold": self.threshold,
             "max_entries": self.max_entries,
             "model_fingerprint": self.model_fingerprint,
+            "query_policy": self.query_policy,
             "next_id": self._next_id,
             "counters": {"hits": self.hits, "misses": self.misses, "evictions": self.evictions},
             "entries": [e.to_dict() for e in self._entries],
@@ -560,7 +666,8 @@ class SemanticCache:
                 tf = {name: archive[name] for name in ("indptr", "indices", "data")}
         params = {"threshold": meta["threshold"], "max_entries": meta["max_entries"]}
         params.update(settings)
-        cache = cls(meta["dim"], model_fingerprint=meta.get("model_fingerprint", ""), **params)
+        cache = cls(meta["dim"], model_fingerprint=meta.get("model_fingerprint", ""),
+                    query_policy=meta.get("query_policy", ""), **params)
         for slot, d in enumerate(meta["entries"]):
             entry = CacheEntry(**d)
             if slot == cache._vectors.shape[0]:
@@ -569,6 +676,7 @@ class SemanticCache:
             cache._last_used[slot] = entry.last_used_at
             cache._rho[slot] = 1.0 if rho is None else float(rho[slot])
             cache._set_owner(slot, entry.owner)
+            cache._set_expiry(slot, entry.expires_at)
             cache._entries.append(entry)
             if tf is not None and slot + 1 < len(tf["indptr"]):
                 a, b = tf["indptr"][slot], tf["indptr"][slot + 1]
@@ -584,8 +692,9 @@ class SemanticCache:
         cache.hits, cache.misses = counters.get("hits", 0), counters.get("misses", 0)
         cache.evictions = counters.get("evictions", 0)
         if cache.lsh is not None and len(cache):
-            cache.lsh.add([e.id for e in cache._entries], cache._vectors[: len(cache)])
+            cache.lsh.add(range(len(cache)), cache._vectors[: len(cache)])
         stale = embedder is not None and (embedder.fingerprint != cache.model_fingerprint
+                                          or embedder.policy_signature != cache.query_policy
                                           or tf is None or rho is None)
         if stale:
             cache.reembed(embedder, min_known_ratio)

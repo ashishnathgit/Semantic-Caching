@@ -77,11 +77,18 @@ class _Encoded:
         return float(min(1.0, np.linalg.norm(zr) / math.sqrt(den))) if den > EPS else 0.0
 
 
-def _encode(emb: "LSAEmbedder", text: str) -> _Encoded:
+def _encode(emb: "LSAEmbedder", text: str, topic_only: bool = False) -> _Encoded:
+    """``topic_only``: the question passed the known-word guard only through the topic-word
+    rule, so (as in LSAEmbedder.encode) it is matched on its known topic words alone."""
     row = emb.tfidf([text]).tocsr()
     row.sort_indices()
     index = row.indices.astype(np.intp)
     weights = row.data.astype(np.float64)
+    if topic_only and index.size:
+        keep = emb.everyday_keep[index] > 0
+        index, weights = index[keep], weights[keep]
+        norm = float(np.sqrt(weights @ weights)) if weights.size else 0.0
+        weights = weights / norm if norm > 0 else weights
     order = np.argsort(-weights, kind="stable")          # heaviest terms first
     index, weights = index[order], weights[order]
     scale = emb.s ** (emb.config.sigma_power - 1.0)
@@ -97,9 +104,12 @@ def _encode(emb: "LSAEmbedder", text: str) -> _Encoded:
 
 
 def _passes_guard(emb: "LSAEmbedder", text: str, ratio: float) -> tuple[int, int, bool]:
-    known, total = emb.coverage(text)
-    ok = total > 0 and (ratio <= 0 or known / total >= ratio) and known > 0
-    return known, total, ok
+    adm = emb.admission(text, ratio)
+    return adm.known, adm.total, adm.passed and adm.total > 0 and adm.known > 0
+
+
+def _relaxed(emb: "LSAEmbedder", text: str, ratio: float) -> bool:
+    return emb.admission(text, ratio).status == "relaxed"
 
 
 def _direction_words(emb: "LSAEmbedder", j: int, n: int = DIRECTION_WORDS) -> list[str]:
@@ -161,7 +171,7 @@ def _explain_match(emb: "LSAEmbedder", q: _Encoded, match: "Match", rank: int, t
                    lsa_weight: float, ratio: float, exact_id: int | None, query_ok: bool,
                    cut: float, readable: bool) -> dict:
     entry = match.entry
-    c = _encode(emb, entry.query)
+    c = _encode(emb, entry.query, _relaxed(emb, entry.query, ratio))
     _, _, c_ok = _passes_guard(emb, entry.query, ratio)
     pair_rho = min(q.rho, c.rho)
     by_overlap = pair_rho < cut
@@ -320,8 +330,10 @@ def explain_query(emb: "LSAEmbedder", cache: "SemanticCache", query: str, *, thr
     tau = cache.threshold if threshold is None else float(threshold)
     cut = cache.min_latent_coverage
     readable = can_read or (lambda entry: True)
-    known, total, guard_ok = _passes_guard(emb, query, min_known_ratio)
-    q = _encode(emb, query)
+    adm = emb.admission(query, min_known_ratio)
+    known, total = adm.known, adm.total
+    guard_ok = adm.passed and total > 0 and known > 0
+    q = _encode(emb, query, adm.status == "relaxed")
     vectors, row = emb.encode([query], min_known_ratio)
 
     # The real decision (the known-word guard may zero the vector) ...
@@ -336,6 +348,8 @@ def explain_query(emb: "LSAEmbedder", cache: "SemanticCache", query: str, *, thr
 
     if decision.method == "exact":
         verdict = "exact"
+    elif decision.refused:
+        verdict = "refused"
     elif len(cache) == 0:
         verdict = "empty"
     elif q.norm < EPS:
@@ -345,7 +359,7 @@ def explain_query(emb: "LSAEmbedder", cache: "SemanticCache", query: str, *, thr
     else:
         verdict = "hit" if decision.hit else "miss"
 
-    return {
+    out = {
         "query": query,
         "normalized": normalize(query),
         "threshold": tau,
@@ -362,7 +376,9 @@ def explain_query(emb: "LSAEmbedder", cache: "SemanticCache", query: str, *, thr
         "tokens": _tokens(emb, query),
         "bigrams": [{"term": t, "known": t in emb.vocab} for t in emb.analyze(query) if " " in t],
         "coverage": {"known": known, "total": total, "ratio": _r(known / total) if total else 0.0,
-                     "min_ratio": min_known_ratio, "passed": guard_ok},
+                     "min_ratio": min_known_ratio, "passed": guard_ok, "relaxed": adm.status == "relaxed",
+                     "topic_known": adm.topic_known, "topic_unknown": adm.topic_unknown,
+                     "everyday_unknown": adm.everyday_unknown},
         "terms": _query_terms(emb, query, q),
         "vocab_size": len(emb.vocab),
         # the question's own rows of V_k (k numbers each) and a sampled band of others
@@ -377,3 +393,9 @@ def explain_query(emb: "LSAEmbedder", cache: "SemanticCache", query: str, *, thr
                                    guard_ok, cut, bool(readable(m.entry)))
                     for i, m in enumerate(neighbours.matches)],
     }
+    if decision.refused:                     # only with cache.negation_guard (off on faq)
+        out["refused"] = decision.refused
+        for m in out["matches"]:
+            if m["id"] == decision.refused["entry_id"]:
+                m["hit"] = False
+    return out

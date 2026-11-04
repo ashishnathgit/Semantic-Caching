@@ -1,0 +1,16 @@
+# Wordy rewordings of FAQ questions, full of everyday words the FAQ model never saw. Written by hand
+# to check the known-word guard's topic-word rule (python -m semcache measure --only guard).
+# Small and not a benchmark: use it to see a change, not to tune on. Columns: question, expected.
+question,expected
+Where do I go to generate a new password if I lost the old one?,How do I reset my password if I forgot it?
+is there some way I can get the reset password thing done since I forgot it,How do I reset my password if I forgot it?
+where would I go to see which python version I actually have installed,How do I check which Python version I have?
+I want to know how I can make my laptop battery last much longer each day,How can I make my laptop battery last longer?
+can someone tell me how one would go about turning off the notifications,How do I turn off notifications?
+"hey, what is the actual meaning of singular value decomposition anyway?",What is singular value decomposition?
+I keep wondering where one can find cheap flights to goa these days,How can I find cheap flights to Goa?
+could you tell me what overfitting really means in machine learning,What is overfitting in machine learning?
+so how exactly would I go and apply for a passport in india,How do I apply for a passport in India?
+what is the thing people call cosine similarity,What is cosine similarity?
+how do I go about running an LLM locally on my own computer,How do I run an LLM locally?
+please let me know what two factor authentication actually is,What is two-factor authentication?

@@ -444,7 +444,8 @@ def run_evaluation(settings: Settings | None = None, pairs_path: str | Path | No
     settings = settings or Settings.load()
     if not LSAEmbedder.exists(settings.model_dir):
         raise FileNotFoundError("no built model; run `python -m semcache build` first")
-    embedder = LSAEmbedder.load(settings.model_dir)
+    from .pipeline import load_embedder          # applies the query-time [cache] policy
+    embedder = load_embedder(settings)
     out = Path(out_dir) if out_dir else settings.eval_dir
     out.mkdir(parents=True, exist_ok=True)
     cfg = settings.eval

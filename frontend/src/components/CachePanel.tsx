@@ -6,8 +6,9 @@ interface Props {
   entries: CacheEntry[];
   user: string;
   isAdmin: boolean;
-  onAdd: (question: string, answer: string, shared: boolean) => Promise<void>;
+  onAdd: (question: string, answer: string, shared: boolean, ttlSeconds: number | null) => Promise<void>;
   onDelete: (id: number) => Promise<void>;
+  onDeleteMany: (ids: number[]) => Promise<void>;
   onReset: () => Promise<void>;
   onResetDemo: () => Promise<void>;
   onResetMetrics: () => Promise<void>;
@@ -45,12 +46,16 @@ function Confirm({ label, confirm, onConfirm }: { label: string; confirm: string
   );
 }
 
-export function CachePanel({ entries, user, isAdmin, onAdd, onDelete, onReset, onResetDemo, onResetMetrics }: Props) {
+export function CachePanel({ entries, user, isAdmin, onAdd, onDelete, onDeleteMany, onReset, onResetDemo, onResetMetrics }: Props) {
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
   const [shared, setShared] = useState(false);
+  const [ttlHours, setTtlHours] = useState("");
   const [rowError, setRowError] = useState<string | null>(null);
-  const canDelete = (e: CacheEntry) => e.owner === user || (e.owner === null && isAdmin);
+  // Admins may delete any entry (FAQ and other users' private ones too); others only their own.
+  const canDelete = (e: CacheEntry) => isAdmin || e.owner === user;
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [confirmBulk, setConfirmBulk] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [confirmReset, setConfirmReset] = useState(false);
@@ -59,6 +64,38 @@ export function CachePanel({ entries, user, isAdmin, onAdd, onDelete, onReset, o
     ? entries.filter((e) => e.query.toLowerCase().includes(filter.trim().toLowerCase()))
     : entries;
 
+  const shownIds = shown.map((e) => e.id);
+  const live = new Set(entries.map((e) => e.id));
+  const chosen = [...selected].filter((id) => live.has(id));
+  const allShown = shownIds.length > 0 && shownIds.every((id) => selected.has(id));
+  const toggle = (id: number) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const toggleShown = () =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const id of shownIds) {
+        if (allShown) next.delete(id);
+        else next.add(id);
+      }
+      return next;
+    });
+
+  async function deleteSelected() {
+    try {
+      await onDeleteMany(chosen);
+      setSelected(new Set());
+      setConfirmBulk(false);
+      setRowError(null);
+    } catch (err) {
+      setRowError((err as Error).message);
+    }
+  }
+
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     if (!question.trim() || !answer.trim()) {
@@ -66,9 +103,15 @@ export function CachePanel({ entries, user, isAdmin, onAdd, onDelete, onReset, o
       return;
     }
     try {
-      await onAdd(question.trim(), answer.trim(), isAdmin && shared);
+      const hours = ttlHours.trim() ? Number(ttlHours) : null;
+      if (hours !== null && (!Number.isFinite(hours) || hours <= 0)) {
+        setFormError("Expiry must be a number of hours above 0, or empty for never.");
+        return;
+      }
+      await onAdd(question.trim(), answer.trim(), isAdmin && shared, hours === null ? null : hours * 3600);
       setQuestion("");
       setAnswer("");
+      setTtlHours("");
       setFormError(null);
     } catch (err) {
       setFormError((err as Error).message);
@@ -92,6 +135,27 @@ export function CachePanel({ entries, user, isAdmin, onAdd, onDelete, onReset, o
           <span className="num text-[13px] text-ink-faint">
             {shown.length} of {entries.length}
           </span>
+          {isAdmin && chosen.length > 0 && (
+            confirmBulk ? (
+              <span className="flex flex-wrap items-center gap-2">
+                <span className="text-[13px] text-ink-soft">
+                  Delete {chosen.length} cached question{chosen.length === 1 ? "" : "s"} for everyone?
+                  {chosen.some((id) => entries.find((e) => e.id === id)?.source === "faq") && " FAQ answers come back with Reset demo."}
+                </span>
+                <button type="button" onClick={deleteSelected} className="h-9 rounded-lg bg-miss px-3 text-[14px] font-medium text-sheet">
+                  Yes, delete
+                </button>
+                <button type="button" onClick={() => setConfirmBulk(false)} className="h-9 rounded-lg border border-rule px-3 text-[14px] text-ink">
+                  Cancel
+                </button>
+              </span>
+            ) : (
+              <button type="button" onClick={() => setConfirmBulk(true)}
+                className="h-9 rounded-lg border border-miss px-3 text-[14px] font-medium text-miss hover:bg-miss-wash">
+                Delete selected ({chosen.length})
+              </button>
+            )
+          )}
           {rowError && (
             <span role="alert" className="text-[13px] text-miss">
               {rowError}
@@ -102,6 +166,12 @@ export function CachePanel({ entries, user, isAdmin, onAdd, onDelete, onReset, o
           <table className="w-full border-collapse text-left text-[14px]">
             <thead className="sticky top-0 bg-paper text-[12px] text-ink-faint">
               <tr>
+                {isAdmin && (
+                  <th className="w-8 py-2 pr-2 font-normal">
+                    <input type="checkbox" checked={allShown} onChange={toggleShown}
+                      aria-label={allShown ? "Unselect the listed questions" : "Select every listed question"} />
+                  </th>
+                )}
                 <th className="py-2 pr-3 font-normal">Question</th>
                 <th className="py-2 pr-3 font-normal">Source</th>
                 <th className="py-2 pr-3 font-normal">Seen by</th>
@@ -113,16 +183,29 @@ export function CachePanel({ entries, user, isAdmin, onAdd, onDelete, onReset, o
             </thead>
             <tbody>
               {shown.map((e) => (
-                <tr key={e.id} className="border-t border-rule align-top">
+                <tr key={e.id} className={`border-t border-rule align-top ${selected.has(e.id) ? "bg-miss-wash" : ""}`}>
+                  {isAdmin && (
+                    <td className="py-2 pr-2">
+                      <input type="checkbox" checked={selected.has(e.id)} onChange={() => toggle(e.id)}
+                        aria-label={`Select “${e.query}”`} />
+                    </td>
+                  )}
                   <td className="py-2 pr-3 text-ink">
                     <details>
                       <summary className="cursor-pointer list-none">{e.query}</summary>
                       <p className="mt-1 mb-0 whitespace-pre-wrap text-[13px] leading-snug text-ink-soft">{e.answer}</p>
                     </details>
                   </td>
-                  <td className="py-2 pr-3 whitespace-nowrap text-ink-soft">{sourceLabel(e.source)}</td>
+                  <td className="py-2 pr-3 whitespace-nowrap text-ink-soft">
+                    {sourceLabel(e.source)}
+                    {e.expires_at ? (
+                      <span className={`ml-1 text-[12px] ${e.expires_at * 1000 < Date.now() ? "text-miss" : "text-ink-faint"}`}>
+                        {e.expires_at * 1000 < Date.now() ? "· expired" : `· expires ${new Date(e.expires_at * 1000).toLocaleString()}`}
+                      </span>
+                    ) : null}
+                  </td>
                   <td className={`py-2 pr-3 whitespace-nowrap ${e.owner ? "text-query" : "text-ink-soft"}`}>
-                    {e.owner ? "Only you" : "Everyone"}
+                    {e.owner ? (e.owner === user ? "Only you" : `Only ${e.owner}`) : "Everyone"}
                   </td>
                   <td className="num py-2 pr-3 text-right text-ink-soft">{e.hits}</td>
                   <td className="py-2 text-right">
@@ -189,6 +272,14 @@ export function CachePanel({ entries, user, isAdmin, onAdd, onDelete, onReset, o
               placeholder="Room 204, second floor of the academic block."
               className="w-full rounded-md border border-rule bg-sheet px-3 py-2 text-[15px] outline-none focus-visible:border-query"
             />
+          </div>
+          <div>
+            <label htmlFor="new-ttl" className="mb-1 block text-[13px] text-ink-soft">
+              Expires after (hours, optional)
+            </label>
+            <input id="new-ttl" inputMode="decimal" value={ttlHours} onChange={(e) => setTtlHours(e.target.value)}
+              placeholder="never"
+              className="h-10 w-32 rounded-md border border-rule bg-sheet px-3 text-[15px] outline-none focus-visible:border-query" />
           </div>
           {isAdmin && (
             <label className="flex items-center gap-2 text-[13px] text-ink-soft">

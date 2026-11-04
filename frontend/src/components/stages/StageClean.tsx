@@ -78,7 +78,10 @@ export function StageClean({ x, playKey }: { x: Explanation; playKey: number }) 
         {x.coverage.total > 0 && (
           <span className={x.coverage.passed ? "text-hit-fill" : "text-miss-fill"}>
             {" "}
-            ({Math.round(x.coverage.ratio * 100)}% known{x.coverage.passed ? "" : `, below ${Math.round(x.coverage.min_ratio * 100)}%: blocked`})
+            ({Math.round(x.coverage.ratio * 100)}% known
+            {x.coverage.relaxed
+              ? `; everyday words not counted, matched on ${(x.coverage.topic_known ?? []).join(", ")}`
+              : x.coverage.passed ? "" : `, below ${Math.round(x.coverage.min_ratio * 100)}%: blocked`})
           </span>
         )}
       </p>

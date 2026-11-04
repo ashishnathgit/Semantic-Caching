@@ -18,6 +18,7 @@ share with everyone.
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import threading
 import time
@@ -29,13 +30,42 @@ from .cache import ALL_USERS, CacheEntry, LookupResult, Match, SemanticCache
 from .config import ADMIN_KEY_ENV, Settings
 from .context import STANDALONE, FollowUp, build_history, detect_follow_up
 from .data import faq_corpus, load_faq, load_question_pairs, unique_questions
-from .embedder import LSAEmbedder
+from .embedder import KnownWordPolicy, LSAEmbedder
 from .explain import explain_query
 from .metrics import MetricsStore, Pricing, parse_bucket
+from .text import exact_key
+from .route import route_trace
 from .users import Message, Thread, UserStore, normalize_username
 
 MAX_QUERY_CHARS = 1000
 HIDDEN_QUESTION = "another user's question"
+
+
+def _words(words: list[str]) -> str:
+    return ", ".join(f'"{w}"' for w in dict.fromkeys(words))
+
+
+def blocked_note(adm, ratio: float, policy) -> str:
+    """Why the known-word guard sent a question to the model, naming the words it didn't know."""
+    note = (f"Only {adm.known} of {adm.total} words are known to the model (at least {ratio:.0%} are needed), "
+            "so a meaning-based match isn't trusted; only an exact repeat can hit.")
+    if policy is not None and adm.topic_unknown:
+        note += (f" Topic words it doesn't know: {_words(adm.topic_unknown)}"
+                 + (f"; everyday words like {_words(adm.everyday_unknown)} were not counted against it" if
+                    adm.everyday_unknown else "")
+                 + f". A second chance needs {policy.min_topic_words} known topic words and "
+                   f"{policy.min_topic_ratio:.0%} of them known; it had {len(adm.topic_known)} of "
+                   f"{len(adm.topic_known) + len(adm.topic_unknown)}.")
+    elif adm.topic_unknown:
+        note += f" Words it doesn't know: {_words(adm.topic_unknown)}."
+    return note
+
+
+def relaxed_note(adm) -> str:
+    return (f"Only {adm.known} of {adm.total} words are known, but {_words(adm.everyday_unknown)} are everyday "
+            f"words that say nothing about the topic, so they weren't counted. Matched on its known topic words "
+            f"({_words(adm.topic_known)}) alone"
+            + (f"; it doesn't know {_words(adm.topic_unknown)}." if adm.topic_unknown else "."))
 
 
 def admin_key_configured() -> bool:
@@ -105,15 +135,39 @@ class AskResult:
     output_tokens: int | None = None
     stored_vector: list[float] | None = None   # the new row of C after a miss (for the math view)
     cache_rows: int = 0                 # rows of C this user's lookups see, after this answer
+    route: dict | None = None           # exact? -> guards -> score vs tau -> angle -> outcome (route.py)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-def build_corpus(settings: Settings, verbose: bool = False) -> tuple[list[str], dict]:
-    """Texts the SVD is fitted on: FAQ questions + paraphrases, plus Quora questions if present."""
+PLACEHOLDER_SOURCES = {"stub"}     # placeholder answers: their text would only teach "placeholder", "ollama"
+
+
+def cached_documents(settings: Settings, entries: list[CacheEntry] | None) -> list[str]:
+    """With ``corpus.include_cached``: one training text per shared cached entry, its question
+    joined with its answer (placeholder answers add only their question). The FAQ answers the
+    cache is warmed with count too, also before the cache exists. Private entries are left out:
+    their words would show up in the shared model's directions."""
+    if not settings.corpus.include_cached:
+        return []
+    docs: dict[str, str] = {}
+    for e in entries or []:
+        if e.owner is not None:
+            continue
+        docs[exact_key(e.query)] = e.query if e.source in PLACEHOLDER_SOURCES else f"{e.query} {e.answer}"
+    if settings.cache.warm_with_faq:
+        for item in load_faq(settings.path(settings.paths.faq_csv)):
+            docs.setdefault(exact_key(item.question), f"{item.question} {item.answer}")
+    return list(docs.values())
+
+
+def build_corpus(settings: Settings, verbose: bool = False,
+                 entries: list[CacheEntry] | None = None) -> tuple[list[str], dict]:
+    """Texts the SVD is fitted on: FAQ questions + paraphrases, plus Quora questions if present,
+    plus (``corpus.include_cached``) every shared cached question joined with its answer."""
     corpus: list[str] = []
-    info = {"faq_texts": 0, "quora_questions": 0, "quora_file": None}
+    info = {"faq_texts": 0, "quora_questions": 0, "quora_file": None, "cached_texts": 0}
     if settings.corpus.use_faq:
         texts = faq_corpus(load_faq(settings.path(settings.paths.faq_csv)))
         corpus += texts
@@ -130,16 +184,45 @@ def build_corpus(settings: Settings, verbose: bool = False) -> tuple[list[str], 
     elif verbose and settings.corpus.use_quora:
         print(f"  (no Quora file at {quora_path}; fitting on the FAQ only. "
               "Run scripts/download_qqp.py for the full corpus.)")
+    cached = cached_documents(settings, entries)
+    corpus += cached
+    info["cached_texts"] = len(cached)
     if not corpus:
         raise ValueError("the corpus is empty: enable use_faq or add the Quora data")
     return corpus, info
+
+
+def save_corpus_snapshot(settings: Settings, corpus: list[str]) -> None:
+    """The exact texts a growing model was fitted on (the Matrix Lab rebuilds X from them)."""
+    if settings.corpus.include_cached:
+        settings.model_dir.mkdir(parents=True, exist_ok=True)
+        path = settings.model_dir / "corpus.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"texts": corpus}, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
 
 
 def cache_params(settings: Settings) -> dict:
     c = settings.cache
     return {"threshold": c.threshold, "max_entries": c.max_entries, "use_lsh": c.use_lsh,
             "lsh_bits": c.lsh_bits, "lsh_tables": c.lsh_tables, "lsh_min_entries": c.lsh_min_entries,
-            "lsa_weight": c.lsa_weight, "min_latent_coverage": c.min_latent_coverage}
+            "lsa_weight": c.lsa_weight, "min_latent_coverage": c.min_latent_coverage,
+            "negation_guard": c.negation_guard, "antonyms": list(c.antonyms), "ttl_seconds": c.ttl_seconds,
+            "per_entry_thresholds": c.per_entry_thresholds, "entry_precision_target": c.entry_precision_target}
+
+
+def configure_embedder(embedder: LSAEmbedder, settings: Settings) -> LSAEmbedder:
+    """Apply the query-time settings of [cache] to a loaded or freshly fitted embedder: the
+    known-word guard's topic-word rule (KnownWordPolicy)."""
+    c = settings.cache
+    embedder.policy = (KnownWordPolicy(int(c.min_topic_words), float(c.min_topic_ratio))
+                       if c.relaxed_known_words else None)
+    embedder._everyday_keep = None
+    return embedder
+
+
+def load_embedder(settings: Settings) -> LSAEmbedder:
+    return configure_embedder(LSAEmbedder.load(settings.model_dir), settings)
 
 
 def new_user_store(settings: Settings) -> UserStore:
@@ -148,7 +231,8 @@ def new_user_store(settings: Settings) -> UserStore:
 
 
 def new_cache(settings: Settings, embedder: LSAEmbedder) -> SemanticCache:
-    return SemanticCache(embedder.dim, model_fingerprint=embedder.fingerprint, **cache_params(settings))
+    return SemanticCache(embedder.dim, model_fingerprint=embedder.fingerprint,
+                         query_policy=embedder.policy_signature, **cache_params(settings))
 
 
 def warm_cache(cache: SemanticCache, settings: Settings, embedder: LSAEmbedder) -> int:
@@ -171,15 +255,21 @@ def build_artifacts(settings: Settings | None = None, verbose: bool = True,
     settings = settings or Settings.load()
     if verbose:
         print(f"Building the semantic cache (profile {settings.profile!r})")
-    corpus, info = build_corpus(settings, verbose)
+    existing = None
+    if settings.corpus.include_cached and not fresh and SemanticCache.exists(settings.cache_dir):
+        existing = SemanticCache.load(settings.cache_dir).entries(newest_first=False)
+    corpus, info = build_corpus(settings, verbose, existing)
     if verbose:
         print(f"  corpus: {len(corpus):,} texts (FAQ {info['faq_texts']:,}, "
-              f"Quora {info['quora_questions']:,})")
-    embedder = LSAEmbedder(settings.embedder).fit(corpus, verbose=verbose)
+              f"Quora {info['quora_questions']:,}"
+              + (f", cached question + answer {info['cached_texts']:,}" if settings.corpus.include_cached else "")
+              + ")")
+    embedder = configure_embedder(LSAEmbedder(settings.embedder).fit(corpus, verbose=verbose), settings)
     for note in embedder.report.notes:
         if verbose:
             print(f"  note: {note}")
     embedder.save(settings.model_dir)
+    save_corpus_snapshot(settings, corpus)
     kept = 0
     if not fresh and SemanticCache.exists(settings.cache_dir):
         cache = SemanticCache.load(settings.cache_dir, embedder, settings.cache.min_known_ratio,
@@ -207,6 +297,13 @@ class SemanticCacheService:
         self.warmup: dict = {"state": "not needed", "ms": None, "error": None}
         self._lock = threading.RLock()
         self._unsaved = 0
+        # Live rebuild (corpus.include_cached): the model generation bumps on every swap, so a
+        # vector computed outside the lock with an older model is recomputed inside it.
+        self._model_gen = 0
+        self._new_since_build = self._entries_after_build()
+        self.rebuild_state: dict = {"state": "idle", "reason": None, "started_at": None, "finished_at": None,
+                                    "seconds": None, "error": None, "generation": 0}
+        self._rebuild_thread: threading.Thread | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings | None = None, build_if_missing: bool = True,
@@ -218,7 +315,7 @@ class SemanticCacheService:
                                         f"`python -m semcache build --profile {settings.profile}`")
             embedder, cache = build_artifacts(settings, verbose)
         else:
-            embedder = LSAEmbedder.load(settings.model_dir)
+            embedder = load_embedder(settings)
             if SemanticCache.exists(settings.cache_dir):
                 cache = SemanticCache.load(settings.cache_dir, embedder, settings.cache.min_known_ratio,
                                            **cache_params(settings))
@@ -226,6 +323,104 @@ class SemanticCacheService:
                 cache = new_cache(settings, embedder)
                 warm_cache(cache, settings, embedder)
         return cls(embedder, cache, build_backend(settings.llm), settings)
+
+    # ------------------------------------------------------------ live rebuild
+    @property
+    def grows(self) -> bool:
+        """True when the model's corpus includes the cached answers (faq-live)."""
+        return bool(self.settings.corpus.include_cached)
+
+    def _entries_after_build(self) -> int:
+        meta = self.settings.model_dir / "embedder.json"
+        if not self.grows or not meta.exists():
+            return 0
+        built = meta.stat().st_mtime
+        return sum(e.created_at > built and e.source != "faq" for e in self.cache.entries())
+
+    def model_status(self) -> dict:
+        every = self.settings.cache.rebuild_every
+        return {**self.rebuild_state, "grows": self.grows, "rebuild_every": every if self.grows else 0,
+                "new_since_build": self._new_since_build, "k": self.embedder.dim,
+                "vocabulary_size": len(self.embedder.vocab), "documents": self.embedder.report.n_docs,
+                "fingerprint": self.embedder.fingerprint}
+
+    def request_rebuild(self, admin: bool = False, reason: str = "admin",
+                        wait: bool = False) -> dict:
+        """Refit TF-IDF + SVD on the FAQ texts plus every shared cached question + answer, in
+        a background thread; re-embed all stored questions; then swap the model atomically.
+        Only for profiles whose corpus includes the cache (it would change nothing elsewhere)."""
+        if reason == "admin" and not admin:
+            raise admin_required("rebuilding the model")
+        if not self.grows:
+            raise ValueError(f"profile {self.settings.profile!r} does not fit on cached answers "
+                             "(corpus.include_cached = false), so a rebuild would give the same model")
+        with self._lock:
+            if self.rebuild_state["state"] == "running":
+                raise RuntimeError("a rebuild is already running")
+            self.rebuild_state = {**self.rebuild_state, "state": "running", "reason": reason,
+                                  "started_at": time.time(), "finished_at": None, "seconds": None, "error": None}
+            thread = threading.Thread(target=self._rebuild, name="model-rebuild", daemon=True)
+            self._rebuild_thread = thread
+        thread.start()
+        if wait:
+            thread.join()
+        return self.model_status()
+
+    def _rebuild(self) -> None:
+        t0 = time.perf_counter()
+        ratio = self.settings.cache.min_known_ratio
+        try:
+            with self._lock:
+                snapshot = self.cache.entries(newest_first=False)
+            corpus, _ = build_corpus(self.settings, entries=snapshot)
+            new = configure_embedder(LSAEmbedder(self.settings.embedder).fit(corpus), self.settings)  # slow: no lock
+            V, X, rho = new.encode_with_rho([e.query for e in snapshot], ratio)
+            from .cache import as_sparse_row
+            pre = {e.id: (V[i], as_sparse_row(X[i]), float(rho[i])) for i, e in enumerate(snapshot)}
+            new.save(self.settings.model_dir)
+            save_corpus_snapshot(self.settings, corpus)
+            with self._lock:                                                # the swap: fast
+                late = self.cache.reembed(new, ratio, precomputed=pre)
+                self.embedder = new
+                self._model_gen += 1
+                self._new_since_build = late
+                self.cache.save(self.settings.cache_dir)
+                self._unsaved = 0
+                self.rebuild_state.update(state="done", finished_at=time.time(),
+                                          seconds=time.perf_counter() - t0, generation=self._model_gen,
+                                          reembedded=len(pre) + late, documents=len(corpus))
+        except Exception as exc:                                            # noqa: BLE001 - report it
+            with self._lock:
+                self.rebuild_state.update(state="failed", finished_at=time.time(), error=str(exc),
+                                          seconds=time.perf_counter() - t0)
+
+    def _note_new_entry(self) -> None:
+        """Count a new cached entry; start a background rebuild every ``rebuild_every`` of them."""
+        if not self.grows:
+            return
+        with self._lock:
+            self._new_since_build += 1
+            due = (self.settings.cache.rebuild_every > 0
+                   and self._new_since_build >= self.settings.cache.rebuild_every
+                   and self.rebuild_state["state"] != "running")
+        if due:
+            try:
+                self.request_rebuild(reason="auto")
+            except RuntimeError:
+                pass
+
+    def _current(self, text: str, enc: tuple, gen: int) -> tuple:
+        """``enc`` = (vector, row, rho) computed with model generation ``gen``; recomputed if the
+        model was swapped since. Call with the lock held."""
+        return enc if gen == self._model_gen else self._encode(text)
+
+    @property
+    def lab(self):
+        """The Matrix Lab (semcache/lab.py): checks and worked numbers; never changes the model."""
+        if getattr(self, "_lab", None) is None:
+            from .lab import Lab
+            self._lab = Lab(self)
+        return self._lab
 
     def start_warm_up(self) -> threading.Thread | None:
         """Load the LLM in the background (the API calls this at startup). The header shows
@@ -283,8 +478,10 @@ class SemanticCacheService:
         or storing anything."""
         query = self._validate(query)
         user = self._user(user)
-        vector, row, rho = self._encode(query)
+        gen = self._model_gen
+        enc = self._encode(query)
         with self._lock:
+            vector, row, rho = self._current(query, enc, gen)
             result = self.cache.lookup(vector, top_k or self.settings.cache.top_k, threshold, record,
                                        query_text=query, query_tfidf=row, user=user, query_rho=rho)
         return result, self.embedder.known_terms(query)
@@ -325,6 +522,17 @@ class SemanticCacheService:
                     "overlap (TF-IDF), not by the SVD.")
         return f"ρ = {rho:.2f}: {rho:.0%} of this question survives in the {k}-dimensional SVD space."
 
+    def route_for(self, lookup: LookupResult, known: int, total: int, *, cache_used: bool = True,
+                  follow: FollowUp = STANDALONE, refreshed: bool = False, use_llm: bool = True,
+                  admission=None) -> dict:
+        """The step-by-step route of one lookup (see semcache/route.py)."""
+        c = self.settings.cache
+        return route_trace(lookup, cache_used=cache_used, follow_reason=follow.reason, refreshed=refreshed,
+                           known=known, total=total, min_known_ratio=c.min_known_ratio,
+                           min_latent_coverage=self.cache.min_latent_coverage,
+                           text_guard_on=bool(getattr(c, "negation_guard", False)), use_llm=use_llm,
+                           admission=admission)
+
     def ask(self, query: str, threshold: float | None = None, top_k: int | None = None,
             use_llm: bool = True, *, user: str | None = None, thread_id: str | None = None,
             use_cache: bool | None = None, admin: bool = False) -> AskResult:
@@ -351,16 +559,20 @@ class SemanticCacheService:
 
         ratio = self.settings.cache.min_known_ratio
         t0 = time.perf_counter()
-        vector, row, rho = self._encode(query)
+        model_gen = self._model_gen
+        enc = self._encode(query)
         t1 = time.perf_counter()
         with self._lock:
+            vector, row, rho = enc = self._current(query, enc, model_gen)
+            model_gen = self._model_gen
             # A follow-up or refresh is still scored (so the UI can show the neighbours)
             # but not recorded: it never counts as a hit or a miss.
             lookup = self.cache.lookup(vector, top_k or self.settings.cache.top_k, threshold,
                                        record=cache_used, query_text=query, query_tfidf=row, user=user,
                                        query_rho=rho)
         t2 = time.perf_counter()
-        known, total = self.embedder.coverage(query)
+        adm = self.embedder.admission(query, ratio)
+        known, total = adm.known, adm.total
         hit = lookup.hit and cache_used
 
         result = AskResult(
@@ -385,18 +597,28 @@ class SemanticCacheService:
             result.note = "Force refresh: the cache was skipped and the model answered."
         elif lookup.method == "exact":
             result.note = "Exact repeat of a cached question."
+        elif lookup.refused:
+            result.note = (f"Negation guard ({lookup.refused['rule']}): {lookup.refused['detail']}. The closest "
+                           f"cached question scored {lookup.refused['score']:.3f}, but its answer would be wrong here, "
+                           "so the question goes to the model.")
         elif total == 0 or not result.known_terms:
             result.note = "None of these words are in the model's vocabulary, so only an exact repeat can hit."
-        elif known / total < ratio:
-            result.note = (f"Only {known} of {total} words are known to the model, so a semantic match "
-                           f"isn't trusted (min_known_ratio = {ratio}); only an exact repeat can hit.")
+        elif adm.status == "blocked":
+            result.note = blocked_note(adm, ratio, self.embedder.policy)
+        elif adm.status == "relaxed":
+            result.note = relaxed_note(adm)
         if total and result.known_terms:
             result.note = " ".join(x for x in (result.note, self.rho_note(lookup)) if x)
+        result.route = self.route_for(lookup, known, total, cache_used=cache_used, follow=follow,
+                                      refreshed=refresh, use_llm=use_llm, admission=adm)
 
         llm_ms, gen = 0.0, None
         if hit:
             result.answer = lookup.best.answer
             result.answer_source = "CACHE"
+            if self.cache.per_entry_thresholds and lookup.method != "exact":
+                with self._lock:                  # an unreported hit counts as correct
+                    self.cache.observe(lookup.best.id, lookup.score, True)
         elif use_llm:
             # Standalone questions call generate(prompt) exactly as before, so backends
             # that don't know about history keep working.
@@ -408,10 +630,11 @@ class SemanticCacheService:
             result.answer_source = ("FALLBACK" if gen.fallback else
                                     "FOLLOW-UP" if follow.is_follow_up and not cache_used else "LLM")
             if refresh:
-                result.stored_id, outcome = self._store_refresh(query, gen, vector, row, rho, user)
+                result.stored_id, outcome = self._store_refresh(query, gen, vector, row, rho, user,
+                                                                model_gen=model_gen)
                 result.note = " ".join(x for x in (result.note, outcome) if x)
             elif gen.cacheable and cache_used:
-                result.stored_id = self._store_shared(query, gen, vector, row, rho, user)
+                result.stored_id = self._store_shared(query, gen, vector, row, rho, user, model_gen=model_gen)
             if gen.error:
                 result.backend_error = gen.error
         else:
@@ -452,21 +675,28 @@ class SemanticCacheService:
         })
 
     def _store_shared(self, query: str, gen, vector, row, rho: float = 1.0,
-                      asked_by: str | None = None) -> int:
+                      asked_by: str | None = None, model_gen: int | None = None) -> int:
         # The lock is released while the LLM runs, so a concurrent request for the same
         # question may have stored an answer meanwhile (the lookup would then have hit an
-        # exact repeat). Keep that first answer instead of replacing it.
+        # exact repeat). Keep that first answer instead of replacing it. The model may also
+        # have been rebuilt meanwhile; then the vector is recomputed with the new one.
+        added = False
         with self._lock:
+            if model_gen is not None:
+                vector, row, rho = self._current(query, (vector, row, rho), model_gen)
             entry = self.cache.find_exact(query)
             if entry is None:
                 entry = self.cache.add(query, gen.text, vector, source=gen.backend, model=gen.model,
                                        tfidf_row=row, rho=float(rho), asked_by=asked_by,
                                        prompt_tokens=gen.prompt_tokens, output_tokens=gen.output_tokens)
                 self._autosave()
-            return entry.id
+                added = True
+        if added:
+            self._note_new_entry()
+        return entry.id
 
     def _store_refresh(self, query: str, gen, vector, row, rho: float,
-                       user: str | None) -> tuple[int | None, str]:
+                       user: str | None, model_gen: int | None = None) -> tuple[int | None, str]:
         """What a forced refresh keeps.
 
         * No cached answer for this exact question: the fresh one is stored, like a miss.
@@ -478,6 +708,8 @@ class SemanticCacheService:
         if not gen.cacheable:
             return None, "The fresh answer is a placeholder, so it is not stored."
         with self._lock:
+            if model_gen is not None:
+                vector, row, rho = self._current(query, (vector, row, rho), model_gen)
             existing = self.cache.find_exact(query, user)
             if existing is not None and not (existing.source == "ollama" and existing.owner is None):
                 kind = {"faq": "an FAQ", "manual": "an admin-added" if existing.owner is None else "your own",
@@ -488,6 +720,7 @@ class SemanticCacheService:
                                    tfidf_row=row, rho=float(rho), asked_by=user,
                                    prompt_tokens=gen.prompt_tokens, output_tokens=gen.output_tokens)
             self._autosave()
+        self._note_new_entry()
         if existing is not None:
             return entry.id, f"Replaced the cached LLM answer #{existing.id} with this one."
         return entry.id, "Stored as a new cached answer."
@@ -545,7 +778,7 @@ class SemanticCacheService:
         return items[:limit] if limit else items
 
     def add_entry(self, question: str, answer: str, source: str = "manual", user: str | None = None,
-                  shared: bool = False, admin: bool = False) -> CacheEntry:
+                  shared: bool = False, admin: bool = False, ttl_seconds: float | None = None) -> CacheEntry:
         """Add an answer by hand. With a ``user`` it is private to them, unless ``shared``
         is set by an admin. Without a user (CLI, scripts) it is shared."""
         question = self._validate(question)
@@ -555,12 +788,100 @@ class SemanticCacheService:
         if user is not None and shared and not admin:
             raise admin_required("adding an answer shared with everyone")
         owner = None if user is None or shared else user
-        vector, row, rho = self._encode(question)
+        gen = self._model_gen
+        enc = self._encode(question)
         with self._lock:
+            vector, row, rho = self._current(question, enc, gen)
             entry = self.cache.add(question, answer.strip(), vector, source=source, tfidf_row=row,
-                                   owner=owner, rho=float(rho))
+                                   owner=owner, rho=float(rho), ttl_seconds=ttl_seconds)
         self._autosave()
+        if owner is None:
+            self._note_new_entry()
         return entry
+
+    # ------------------------------------------------------------ data and admin
+    LEARNED_KEEP = frozenset({"faq", "manual"})      # sources that are not LLM output
+
+    def forget_llm_rows(self, admin: bool = False) -> dict:
+        """Admin: remove every entry an LLM backend produced (Ollama, an online model or the
+        placeholder), keeping the FAQ and answers added by hand."""
+        if not admin:
+            raise admin_required("forgetting the LLM-learned answers")
+        with self._lock:
+            removed = self.cache.remove_where(lambda e: e.source not in self.LEARNED_KEEP)
+            self.cache.save(self.settings.cache_dir)
+            self._unsaved = 0
+        return {"removed": removed, "entries": len(self.cache)}
+
+    def import_csv(self, name: str, text: str, admin: bool = False) -> dict:
+        """Admin: build a NEW profile from an FAQ CSV (see semcache/importer.py). The running
+        profile, and faq, are never touched."""
+        if not admin:
+            raise admin_required("importing an FAQ CSV")
+        from .importer import import_faq_csv
+        if name.strip().lower() == self.settings.profile:
+            raise ValueError("importing into the profile that is being served is not allowed; pick a new name")
+        return import_faq_csv(self.settings, name, text)
+
+    @property
+    def feedback_path(self):
+        return self.settings.artifacts_dir / "feedback" / "wrong_answers.jsonl"
+
+    def report_wrong(self, query: str, entry_id: int, user: str | None = None, admin: bool = False) -> dict:
+        """"Wrong answer" on a hit: log (question, cached question, score, tau) for threshold tuning,
+        and evict the entry. FAQ answers and shared answers added by hand are evicted only by an
+        admin (anyone else's report is logged and the answer stays); private entries only by
+        their owner."""
+        query = self._validate(query)
+        user = self._user(user)
+        gen = self._model_gen
+        enc = self._encode(query)
+        with self._lock:
+            entry = self.cache.get(entry_id)
+            if entry is None or (entry.owner is not None and entry.owner != user and not admin):
+                raise LookupError(f"no entry with id {entry_id}")
+            vector, row, rho = self._current(query, enc, gen)
+            every = self.cache.score_all(vector, row, rho, user)
+            score = next((float(sc) for e, sc in zip(every["entries"], every["scores"]) if e.id == entry_id), None)
+            protected = (entry.source == "faq" or (entry.source == "manual" and entry.owner is None)) and not admin
+            # Experimental per-entry thresholds: a semantic hit tightens the entry's own tau instead
+            # of evicting it (an exact repeat that is wrong is still evicted: no tau can fix it).
+            exact = self.cache.find_exact(query, user) is not None and self.cache.find_exact(query, user).id == entry_id
+            learn = self.cache.per_entry_thresholds and score is not None and not exact
+            new_tau = self.cache.observe(entry_id, score, False, replace_positive=True) if learn else None
+            evict = not protected and not learn
+            record = {"t": time.time(), "user": user, "query": query, "entry_id": entry_id,
+                      "cached_query": entry.query, "source": entry.source,
+                      "score": None if score is None else round(score, 4), "tau": self.cache.threshold,
+                      "evicted": evict, "entry_threshold": new_tau, "model": self.embedder.fingerprint}
+            if learn:
+                self.cache.save(self.settings.cache_dir)
+            if evict:
+                self.cache.remove(entry_id)
+                self.cache.save(self.settings.cache_dir)
+                self._unsaved = 0
+            self.feedback_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.feedback_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        note = (f"Thanks: this answer now needs a score of at least {new_tau or self.cache.threshold:.2f} "
+                "to be served (per-entry threshold); the pair is logged." if learn else
+                "Thanks: the answer was removed from the cache and the pair logged for threshold tuning."
+                if evict else
+                "Thanks: logged for threshold tuning. FAQ and admin answers can only be removed by an admin.")
+        return {**record, "note": note}
+
+    def remove_entries(self, entry_ids: list[int], admin: bool = False) -> dict:
+        """Admin: delete several cached entries at once (any owner, FAQ included), saving once."""
+        if not admin:
+            raise admin_required("deleting cached questions")
+        ids = list(dict.fromkeys(int(i) for i in entry_ids))
+        with self._lock:
+            removed = [i for i in ids if self.cache.remove(i)]
+            if removed:
+                self.cache.save(self.settings.cache_dir)
+                self._unsaved = 0
+        return {"removed": len(removed), "missing": [i for i in ids if i not in set(removed)],
+                "entries": len(self.cache)}
 
     def remove_entry(self, entry_id: int, user: str | None = None, admin: bool = False) -> bool:
         """Delete an entry. A user may delete their own private entries; shared entries
@@ -592,9 +913,9 @@ class SemanticCacheService:
         items = load_faq(self.settings.path(self.settings.paths.faq_csv))
         missing = [i for i in items if self.cache.find_exact(i.question) is None]
         if missing:
-            vectors, rows, rho = self.embedder.encode_with_rho([i.question for i in missing],
-                                                               self.settings.cache.min_known_ratio)
             with self._lock:
+                vectors, rows, rho = self.embedder.encode_with_rho([i.question for i in missing],
+                                                                   self.settings.cache.min_known_ratio)
                 self.cache.add_many([(i.question, i.answer) for i in missing], vectors, source="faq",
                                     tfidf_rows=rows, rhos=rho)
             self.save()

@@ -11,6 +11,7 @@ rest of the package calls into it (``from semcache import linalg as la``):
     SVD                   exact_svd                  (small, dense)
                           randomized_svd             (large, sparse)
                           truncated_svd              (picks one of the two)
+                          brand_update_rows          (incremental: append rows, Brand 2006)
     LSA projection        fold_in, project, zero_columns
     Latent coverage       latent_coverage            (how much of a row survives the SVD)
     Similarity            cosine_scores, cosine_matrix, rowwise_cosine, sparse_dot,
@@ -60,6 +61,8 @@ __all__ = [
     "exact_svd",
     "randomized_svd",
     "truncated_svd",
+    "brand_update_rows",
+    "subspace_distance",
     "fold_in",
     "project",
     "zero_columns",
@@ -262,7 +265,7 @@ def _off_diagonal_norm(A: np.ndarray) -> float:
     return float(np.sqrt(np.einsum("ij,ij->", off, off)))
 
 
-def jacobi_eigh(S: np.ndarray, tol: float = 1e-12, max_sweeps: int = 60):
+def jacobi_eigh(S: np.ndarray, tol: float = 1e-12, max_sweeps: int = 60, trace: dict | None = None):
     """Eigenvalues and eigenvectors of a real symmetric matrix, S = W diag(w) W^T.
 
     Jacobi's method: repeatedly pick an off-diagonal entry S[p, q] and rotate
@@ -276,7 +279,13 @@ def jacobi_eigh(S: np.ndarray, tol: float = 1e-12, max_sweeps: int = 60):
     product of all rotations is the eigenvector matrix W.
 
     Returns ``(w, W)`` with eigenvalues sorted in descending order.
+
+    Pass a dict as ``trace`` to have it filled with what the solver did (the result is
+    unchanged): ``size``, ``sweeps``, ``rotations``, ``seconds``, ``converged`` and
+    ``off_norms``, the off-diagonal norm ||offdiag(A)||_F before each sweep and at the end.
     """
+    import time as _time
+    t_start = _time.perf_counter()
     A = np.array(S, dtype=np.float64, copy=True)
     if A.ndim != 2 or A.shape[0] != A.shape[1]:
         raise ValueError("jacobi_eigh expects a square matrix")
@@ -286,16 +295,23 @@ def jacobi_eigh(S: np.ndarray, tol: float = 1e-12, max_sweeps: int = 60):
     n = A.shape[0]
     A = 0.5 * (A + A.T)
     W = np.eye(n)
+    if trace is not None:
+        trace.update(size=n, sweeps=0, rotations=0, off_norms=[], converged=True, seconds=0.0, tol=tol)
     if n <= 1 or scale == 0.0:
         return A.diagonal().copy(), W
 
     frob = float(np.sqrt(np.einsum("ij,ij->", A, A)))
     rounds = _round_robin_rounds(n)
     converged = False
+    sweeps = rotations = 0
+    off_norms: list[float] = []
     for _ in range(max_sweeps):
-        if _off_diagonal_norm(A) <= tol * frob:
+        off = _off_diagonal_norm(A)
+        off_norms.append(off)
+        if off <= tol * frob:
             converged = True
             break
+        sweeps += 1
         for P, Q in rounds:
             if P.size == 0:
                 continue
@@ -304,6 +320,7 @@ def jacobi_eigh(S: np.ndarray, tol: float = 1e-12, max_sweeps: int = 60):
             if not active.any():
                 continue
             P, Q, apq = P[active], Q[active], apq[active]
+            rotations += int(P.size)
             tau = (A[Q, Q] - A[P, P]) / (2.0 * apq)
             t = np.sign(tau) / (np.abs(tau) + np.sqrt(1.0 + tau * tau))
             t[tau == 0.0] = 1.0           # 45-degree rotation
@@ -324,8 +341,14 @@ def jacobi_eigh(S: np.ndarray, tol: float = 1e-12, max_sweeps: int = 60):
             w_p, w_q = W[:, P], W[:, Q]
             W[:, P] = w_p * c - w_q * s
             W[:, Q] = w_p * s + w_q * c
-    if not converged and _off_diagonal_norm(A) > tol * frob:
+    if not converged:
+        off_norms.append(_off_diagonal_norm(A))
+        converged = off_norms[-1] <= tol * frob
+    if not converged:
         warnings.warn("jacobi_eigh: did not fully converge; results may be inaccurate")
+    if trace is not None:
+        trace.update(sweeps=sweeps, rotations=rotations, off_norms=off_norms, converged=converged,
+                     frobenius=frob, seconds=_time.perf_counter() - t_start)
 
     w = A.diagonal().copy()
     order = np.argsort(w)[::-1]
@@ -336,7 +359,7 @@ def jacobi_eigh(S: np.ndarray, tol: float = 1e-12, max_sweeps: int = 60):
 # 5. Singular value decomposition
 # ---------------------------------------------------------------------------
 
-def exact_svd(A: np.ndarray, k: int | None = None):
+def exact_svd(A: np.ndarray, k: int | None = None, trace: dict | None = None):
     """Thin SVD of a small dense matrix, A = U diag(s) V^T.
 
     Uses the classic identity: if A^T A = V diag(s^2) V^T (an eigen-
@@ -349,18 +372,18 @@ def exact_svd(A: np.ndarray, k: int | None = None):
     routine. For LSA we only keep the largest ones, where this is harmless.
 
     Returns ``(U, s, V)``, singular values in descending order. Pass ``k`` to
-    keep only the top-k triplets.
+    keep only the top-k triplets. ``trace`` is handed to jacobi_eigh.
     """
     A = np.asarray(A, dtype=np.float64)
     m, n = A.shape
     if m >= n:
-        w, V = jacobi_eigh(A.T @ A)
+        w, V = jacobi_eigh(A.T @ A, trace=trace)
         s = np.sqrt(np.clip(w, 0.0, None))
         U = np.zeros((m, n))
         nz = s > (s[0] * 1e-12 if s.size and s[0] > 0 else np.inf)
         U[:, nz] = (A @ V[:, nz]) / s[nz]
     else:
-        w, U = jacobi_eigh(A @ A.T)
+        w, U = jacobi_eigh(A @ A.T, trace=trace)
         s = np.sqrt(np.clip(w, 0.0, None))
         V = np.zeros((n, m))
         nz = s > (s[0] * 1e-12 if s.size and s[0] > 0 else np.inf)
@@ -370,7 +393,8 @@ def exact_svd(A: np.ndarray, k: int | None = None):
     return U, s, V
 
 
-def _randomized_svd_core(A, k: int, oversample: int, power_iters: int, seed: int):
+def _randomized_svd_core(A, k: int, oversample: int, power_iters: int, seed: int,
+                         trace: dict | None = None):
     """Randomized SVD for an m x n matrix with m <= n (orthonormalise on the short side)."""
     m, n = A.shape
     width = min(k + oversample, m)
@@ -389,7 +413,7 @@ def _randomized_svd_core(A, k: int, oversample: int, power_iters: int, seed: int
     Bt = np.asarray(A.T @ Q)
 
     # Step 4: SVD of the small B through the eigen-decomposition of B B^T.
-    w, W = jacobi_eigh(Bt.T @ Bt)
+    w, W = jacobi_eigh(Bt.T @ Bt, trace=trace)
     s = np.sqrt(np.clip(w, 0.0, None))
     U = Q @ W
     V = np.zeros((n, width))
@@ -398,7 +422,8 @@ def _randomized_svd_core(A, k: int, oversample: int, power_iters: int, seed: int
     return U[:, :k], s[:k], V[:, :k]
 
 
-def randomized_svd(A, k: int, oversample: int = 20, power_iters: int = 7, seed: int = 0):
+def randomized_svd(A, k: int, oversample: int = 20, power_iters: int = 7, seed: int = 0,
+                   trace: dict | None = None):
     """Truncated SVD  A ~= U_k diag(s_k) V_k^T  for large (sparse) matrices.
 
     Halko, Martinsson & Tropp (2011), "Finding structure with randomness":
@@ -418,19 +443,80 @@ def randomized_svd(A, k: int, oversample: int = 20, power_iters: int = 7, seed: 
         raise ValueError(f"k must be between 1 and min(m, n) = {min(m, n)}, got {k}")
     if m > n:
         # Run on A^T so Gram-Schmidt works on the short side, then swap U and V.
-        V, s, U = _randomized_svd_core(A.T, k, oversample, power_iters, seed)
+        V, s, U = _randomized_svd_core(A.T, k, oversample, power_iters, seed, trace)
         return U, s, V
-    return _randomized_svd_core(A, k, oversample, power_iters, seed)
+    return _randomized_svd_core(A, k, oversample, power_iters, seed, trace)
 
 
 def truncated_svd(A, k: int, oversample: int = 20, power_iters: int = 7, seed: int = 0,
-                  exact_limit: int = 300):
+                  exact_limit: int = 300, trace: dict | None = None):
     """Top-k SVD. If the shorter side is at most ``exact_limit`` the matrix is small
-    enough to densify, so ``exact_svd`` is used; otherwise ``randomized_svd``."""
+    enough to densify, so ``exact_svd`` is used; otherwise ``randomized_svd``.
+    ``trace`` (a dict) records the Jacobi solver's work and which path ran."""
     if min(A.shape) <= exact_limit:
+        if trace is not None:
+            trace["path"] = "exact"
         dense = A.toarray() if sp.issparse(A) else np.asarray(A, dtype=np.float64)
-        return exact_svd(dense, k)
-    return randomized_svd(A, k, oversample=oversample, power_iters=power_iters, seed=seed)
+        return exact_svd(dense, k, trace=trace)
+    if trace is not None:
+        trace["path"] = "randomized"
+    return randomized_svd(A, k, oversample=oversample, power_iters=power_iters, seed=seed, trace=trace)
+
+
+def brand_update_rows(U: np.ndarray, s: np.ndarray, V: np.ndarray, A, k: int | None = None,
+                      rank_tol: float = 1e-12):
+    """Incremental SVD (Brand 2006): the SVD of X with new rows A appended, from X's SVD.
+
+    Given X = U diag(s) V^T (m x n, rank r) and new rows A (p x n):
+
+        L = V^T A^T                 (r x p)   the new rows' coordinates in X's row space
+        H = A^T - V L               (n x p)   what lies outside it
+        H = P R                                (Gram-Schmidt QR, P orthonormal)
+        K = [[diag(s), L], [0, R]]  ((r+p) x (r+p))
+        K = U_K diag(s') V_K^T                 (exact_svd, Jacobi)
+
+        [X; A] = ([[U, 0], [0, I]] V_K) diag(s') ([V, P] U_K)^T
+
+    Exact when U, s, V hold every non-zero singular triplet of X; when X's SVD was
+    truncated the result is an approximation. Costs O((m + n)(r + p)^2 + (r + p)^3)
+    instead of a full refit. Returns (U', s', V'), truncated to ``k`` if given.
+    """
+    U = np.asarray(U, dtype=np.float64)
+    V = np.asarray(V, dtype=np.float64)
+    s = np.asarray(s, dtype=np.float64)
+    At = np.asarray(A.T.toarray() if sp.issparse(A) else np.asarray(A, dtype=np.float64).T)
+    r, p = s.size, At.shape[1]
+    L = V.T @ At
+    H = At - V @ L
+    P, R = gram_schmidt_qr(H, rank_tol=rank_tol)
+    K = np.zeros((r + p, r + p))
+    K[:r, :r] = np.diag(s)
+    K[:r, r:] = L
+    K[r:, r:] = R
+    UK, s_new, VK = exact_svd(K)
+    m = U.shape[0]
+    left = np.zeros((m + p, r + p))
+    left[:m, :r] = U
+    left[m:, r:] = np.eye(p)
+    U_new = left @ VK
+    V_new = np.hstack([V, P]) @ UK
+    keep = s_new > (s_new[0] * 1e-12 if s_new.size and s_new[0] > 0 else np.inf)
+    U_new, s_new, V_new = U_new[:, keep], s_new[keep], V_new[:, keep]
+    if k is not None:
+        U_new, s_new, V_new = U_new[:, :k], s_new[:k], V_new[:, :k]
+    return U_new, s_new, V_new
+
+
+def subspace_distance(V1: np.ndarray, V2: np.ndarray) -> float:
+    """sin of the largest principal angle between the column spans of two orthonormal bases
+    (0 = the same subspace, 1 = some direction of one is orthogonal to the other)."""
+    # sin(theta_max) = ||(I - V1 V1^T) V2||_2, computed from the residual itself: forming
+    # sqrt(1 - cos^2) would lose half the digits when the angle is tiny.
+    k = min(V1.shape[1], V2.shape[1])
+    A, B = V1[:, :k], V2[:, :k]
+    R = B - A @ (A.T @ B)
+    _, sines, _ = exact_svd(R)
+    return float(min(1.0, sines.max())) if sines.size else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -641,6 +727,22 @@ class RandomHyperplaneLSH:
                 bucket.discard(item_id)
                 if not bucket:
                     del table[int(key)]
+
+    def rename(self, old_id: int, new_id: int) -> None:
+        """Give the item stored as ``old_id`` the id ``new_id`` (same buckets): O(L).
+
+        The cache stores row positions of C as ids; when a removal moves the last row
+        into the freed slot, only that one item is relabelled."""
+        row = self._keys.pop(old_id, None)
+        if row is None:
+            return
+        if new_id in self._keys:
+            self.remove(new_id)
+        for table, key in zip(self.tables, row):
+            bucket = table[int(key)]
+            bucket.discard(old_id)
+            bucket.add(new_id)
+        self._keys[new_id] = row
 
     def candidates(self, q: np.ndarray) -> np.ndarray:
         """Ids sharing at least one bucket with q."""

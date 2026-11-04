@@ -34,10 +34,17 @@ semantic-cache/
 │   ├── linalg.py                 ★ every matrix operation, from scratch (the file the rest calls)
 │   ├── text.py                   tokenizer, stopwords, plural folding, vocabulary
 │   ├── embedder.py               LSAEmbedder: fit TF-IDF + SVD, embed new text, rho, save/load
-│   ├── cache.py                  SemanticCache: exact layer, guarded hybrid score, LRU, LSH, persistence
-│   ├── backends.py               who answers a miss: Ollama (with warm-up and token counts), or the stub
+│   ├── cache.py                  SemanticCache: exact layer, guarded hybrid score, LRU, LSH, TTL, persistence
+│   ├── guards.py                 negation guard: negation, antonym, number and name rules (faq-live)
+│   ├── backends.py               who answers a miss: Ollama, an online OpenAI-compatible model, the stub, a chain
 │   ├── pipeline.py               SemanticCacheService: ask, explain, force refresh, admin, privacy, reset-demo
 │   ├── explain.py                every number behind one lookup, for the live math panel
+│   ├── route.py                  the route of one question (exact → guards → score vs τ → angle → outcome)
+│   ├── lab.py                    the Matrix Lab: Eckart–Young check, Jacobi trace, worked maths, FLOPs, sandbox refit
+│   ├── measure.py                `measure`: headline numbers, traffic mix, τ cross-validation, LSH sweep, studies
+│   ├── importer.py               "Import FAQ CSV" into a new profile (artifacts/<name>/)
+│   ├── thresholds.py             experimental per-entry thresholds learned from "Wrong answer"
+│   ├── neural.py                 optional MiniLM baseline for the evaluation only (requirements-neural.txt)
 │   ├── metrics.py                request events, counters, latency, estimated cost, time series
 │   ├── preflight.py              PASS/FAIL checks before going on stage
 │   ├── users.py                  users and their conversation threads
@@ -69,6 +76,9 @@ semantic-cache/
 ├── config.toml                   every setting in one place, plus the two profiles
 ├── requirements.txt              runtime dependencies
 ├── requirements-dev.txt          tests, notebook, dataset download
+├── requirements-neural.txt       optional: MiniLM baseline (exact pins)
+├── .env.example                  online-model settings (copy to .env, which is never committed)
+├── DECISIONS.md, REPORT.md       what was decided and measured when phases A–G were added
 └── pyproject.toml                package metadata, pytest settings
 ```
 
@@ -158,7 +168,7 @@ $$
 P(\text{candidate}) = 1 - \left(1 - \left(1 - \frac{\theta}{\pi}\right)^{b}\right)^{L}
 $$
 
-Two more safety rules sit around the math: an **exact-match layer** (a repeated question is always a hit), and a **known-word guard**: if fewer than `min_known_ratio` of a question's words are in the vocabulary, it may hit only by exact repeat.
+Two more safety rules sit around the math: an **exact-match layer** (a repeated question is always a hit), and a **known-word guard**: if fewer than `min_known_ratio` of a question's words are in the vocabulary, it may hit only by exact repeat. Everyday words the model never saw ("where", "go", "one" …) don't count against a question: with them left out, a question that knows at least 2 topic words, 40% of its topic words, gets a second chance and is matched on those topic words alone (`cache.relaxed_known_words`). So "Where do I go to generate a new password if I lost the old one?" reaches the reset-password answer, while "what is the capital of france" stays blocked; the answer card names the words the model didn't know.
 
 **The live math panel** (`/api/explain`) shows all of this for the question being typed, in six stages, with the real numbers: clean the text, the TF-IDF row, the fold into meaning space (the question's own rows of $V_k$ slide out, are weighted and summed into $e$; both $\rho$ values), $s = C e$ over the cache matrix, the decision (bars, $\tau$, the angle fan), and learning (the new answer's vector joins $C$ as a new row). Its per-word and per-direction parts are exact: with $t_a$ the latent vector of term $a$ and $z_q = \sum_a q_a t_a$,
 
@@ -215,7 +225,10 @@ python -m semcache backend        # checks the connection and lists your models
 | Profile | Corpus | Model | Score | Use it for |
 |---|---|---|---|---|
 | `faq` | the 172 FAQ texts | $k$ = 60, 327 terms | pure LSA | the stage demo and the slides |
+| `faq-live` | the FAQ texts + every cached question joined with its answer | $k$ = 75, 794 terms at the start; grows | pure LSA + negation guard | a vocabulary that grows with the cache |
 | `quora` | 100,000 Quora questions + the FAQ (100,172 texts) | $k$ = 200, 40,000 terms | hybrid (0.5), $\rho$ cutoff 0.25 | the evaluation |
+
+`faq-live` refits in the background after every 20 new cached answers (or **Rebuild model** in the admin area), re-embeds every stored question and swaps the model in one step; requests keep being answered meanwhile. Profiles made with **Import FAQ CSV** live in `artifacts/<name>/` and are served like any other (`serve --profile campus`).
 
 ```bash
 python -m semcache build --profile faq           # seconds
@@ -236,6 +249,7 @@ python -m semcache warm                          # put back missing FAQ answers,
 python -m semcache reset-demo                    # exactly the 43 FAQ answers, metrics archived, counters zeroed
 python -m semcache preflight                     # PASS/FAIL checks before going on stage
 python -m semcache evaluate                      # the evaluation report (see below)
+python -m semcache measure                       # headline numbers, traffic mix, τ cross-validation, LSH sweep, ...
 python -m semcache users                         # also: threads --user NAME, stats, backend, reset
 ```
 
@@ -246,6 +260,8 @@ python -m semcache serve --profile faq           # open http://127.0.0.1:8000
 ```
 
 The left column has the question box (with a **Demo script** menu and a **Force refresh (skip cache)** checkbox), the answer card (source CACHE / LLM / FOLLOW-UP / FALLBACK, similarity %, time, $\rho$) and the conversation. The right column is the **live math panel**: it re-runs `/api/explain` 250 ms after you stop typing and plays the six stages. Below the fold: live stats, the "Cache performance over time" chart (everyone or just you), the cached answers with the admin area, and what the SVD learned.
+
+A **Matrix Lab** switch above the page (never shown in presentation mode) opens a second view, all text at least 18 px: the route of a question (exact → guards → score vs τ → angle → HIT / LLM / BLOCKED), the worked maths with real numbers (idf of the rarest word, the TF-IDF row, $e$, the best cosine as a sum, $\theta$ vs $\arccos\tau$), correctness checks ($\lVert X - X_k\rVert_F^2$ against $\sum_{i>k}\sigma_i^2$, $\lVert V_k^\top V_k - I\rVert_F$, Jacobi sweeps and rotations with the off-diagonal norm per sweep), the singular values and cumulative energy with $k$ marked, latency per request (hits vs LLM calls, log scale), a $k$ slider that refits a sandbox copy (the served model never changes) and the FLOPs of a hit vs an LLM answer (an estimate). The answer card also shows the route and has a **Wrong answer** button: it removes the cached answer (FAQ and admin answers need an admin) and logs the pair to `artifacts/<profile>/feedback/wrong_answers.jsonl` for threshold tuning.
 
 The UI is built for laptop and projector screens: the minimum supported width is **1280 px** (checked at 1920×1080, 1440×900 and 1280×720). Narrower windows stack the columns but are not tuned.
 
@@ -331,6 +347,12 @@ Every `/api/ask` appends one event to `artifacts/<profile>/metrics/events.jsonl`
 
 **Reset metrics** (admin) archives the file as `events-<time>.jsonl` and starts over; **Reset demo** does that too.
 
+### Online models and privacy
+
+Besides Ollama, a miss can be answered by any OpenAI-compatible API (OpenAI, Groq, OpenRouter, a vLLM server). Copy `.env.example` to `.env` and fill in `SEMCACHE_OPENAI_BASE_URL`, `SEMCACHE_OPENAI_MODEL` and `SEMCACHE_OPENAI_API_KEY`, then set `[llm] backend = "openai_compatible"` or a fallback chain such as `chain = ["openai_compatible", "ollama", "stub"]`. Ollama stays the default. The answer card and the metrics show which backend answered, and the API's real token counts feed the cost cards.
+
+**Privacy:** in online mode every question that misses the cache is sent to that provider (cache hits are not). The API key stays on the server: it is never sent to the browser, shown by `/api/health` or written to logs, metrics or the saved cache. `.env` is git-ignored; only `.env.example` is meant to be committed.
+
 ## Evaluation
 
 ```bash
@@ -338,6 +360,8 @@ python -m semcache evaluate --profile quora                  # report.md, report
 python -m semcache evaluate --profile quora --guard-sweep     # latent stopwords x k x rho cutoff (about a minute)
 python -m semcache evaluate --profile faq                     # the FAQ's own held-out phrasings
 ```
+
+`python -m semcache measure --profile faq` adds `measurements.md` / `.json`: the headline numbers with the AUC over 12 negative-sampling seeds, a traffic-mix simulation with $E[\text{cost}] = c_{\text{lookup}} + (1-h)\,c_{\text{LLM}}$ (prices in `[eval]` are assumptions), $\tau$ chosen by cross-validation, the LSH sweep over $b$ and $L$, fact checks, and (with `--only`) latent stopwords, incremental SVD, per-entry thresholds and the MiniLM baseline (`evaluate --neural`, needs `requirements-neural.txt`). REPORT.md collects the results.
 
 Writes `artifacts/<profile>/eval/report.md`, `report.json` and five charts:
 
@@ -414,9 +438,16 @@ Everything lives in `config.toml`; `[profiles.<name>.<section>]` tables override
 | `cache.lsa_weight` | 1.0 (Quora: 0.5) | 1 = pure LSA; lower blends in the TF-IDF cosine |
 | `cache.min_latent_coverage` | 0.30 (Quora: 0.25) | $\rho$ guard cutoff |
 | `cache.min_known_ratio` | 0.5 | share of words that must be known for a semantic hit |
-| `cache.use_lsh` | false | approximate search for large caches |
+| `cache.relaxed_known_words` | true (faq-live: false) | unknown everyday words don't count; ≥ `min_topic_words` (2) known topic words making up ≥ `min_topic_ratio` (0.4) admit the question, matched on those words |
+| `cache.use_lsh` | false | approximate search for large caches (b = 10, L = 24 from the LSH sweep; used from 50,000 entries) |
+| `cache.negation_guard` | false (faq-live: true) | refuse a semantic hit whose negation, antonym (`cache.antonyms`), number or name differs |
+| `cache.ttl_seconds` | 0 | default lifetime of new entries; 0 = never expire (an expired entry is a miss) |
+| `cache.rebuild_every` | 0 (faq-live: 20) | with `corpus.include_cached`, refit after this many new entries |
+| `cache.per_entry_thresholds` | false | experimental: "Wrong answer" raises that entry's own $\tau$ |
+| `corpus.include_cached` | false (faq-live: true) | also fit on every shared cached question joined with its answer |
+| `llm.chain` | [] | e.g. `["openai_compatible", "ollama", "stub"]`: try each in order |
 | `cache.max_entries` | 5000 | least recently used entries are evicted beyond this |
-| `llm.backend` | "ollama" | or "stub"; `serve --backend stub` or `SEMCACHE_LLM_BACKEND` overrides it |
+| `llm.backend` | "ollama" | or "openai_compatible" or "stub"; `serve --backend stub` or `SEMCACHE_LLM_BACKEND` overrides it |
 | `llm.model` | "auto" | first pulled Ollama model, or a name like "llama3.2:3b" |
 | `llm.cache_stub_answers` | true | with the stub backend, cache placeholder answers (fallback answers never are) |
 | `users.detect_follow_ups` | true | follow-ups skip the cache and use the conversation history |
@@ -462,6 +493,13 @@ Send `X-User: <name>` to act as a user, and `X-Admin-Key: <passphrase>` for admi
 | POST | `/api/reset` | | admin: reset the shared cache; others: remove their own entries |
 | POST | `/api/reset-demo` | | admin: exactly the FAQ answers, metrics archived, counters zeroed |
 | GET | `/api/model` | | singular values, energy, top terms per direction |
+| GET | `/api/model/status` | | growing model (faq-live): k, vocabulary, new entries since the last fit |
+| POST | `/api/admin/rebuild` | | admin: refit on the FAQ + cached answers in the background, then swap |
+| POST | `/api/admin/import-csv` | `{profile, csv}` | admin: a new profile from an FAQ CSV (question, answer) |
+| POST | `/api/admin/entries/delete` | `{ids}` | admin: delete several cached questions at once (any owner) |
+| POST | `/api/admin/forget-llm` | | admin: remove every LLM-produced answer |
+| POST | `/api/feedback/wrong` | `{query, entry_id}` | "Wrong answer": log the pair, evict the entry |
+| GET, POST | `/api/lab/correctness`, `/lab/worked`, `/lab/ops`, `/lab/refit`, `/lab/latency` | `{query}`, `{k, query?}` | the Matrix Lab; nothing changes the served model |
 
 ## Sharing the project
 
@@ -494,20 +532,20 @@ Screenshots at other sizes are regenerated with `node scripts/screenshots.mjs ht
 
 **Make it more accurate**
 
-1. A negation guard: after a semantic hit, check a small antonym list (enable/disable, on/off, increase/decrease) and refuse the hit if the query and the cached question disagree.
-2. Compare with a pretrained sentence-embedding model (MiniLM) behind the same cache interface; then fine-tune it on Quora pairs.
+1. ~~A negation guard~~ (done: `cache.negation_guard`, on for faq-live).
+2. ~~Compare with MiniLM behind the same interface~~ (done: `evaluate --neural`); next: fine-tune it on Quora pairs.
 3. Per-region thresholds: run k-means on the cached vectors and learn one $\tau$ per cluster, since dense regions need a stricter threshold.
-4. A feedback button ("wrong answer") that evicts the entry and records the pair for threshold tuning.
+4. ~~A "wrong answer" button~~ (done; per-entry thresholds learned from it are behind `cache.per_entry_thresholds`).
 
 **Make it scale**
 
-5. Incremental SVD (Brand's update) or a scheduled refit on logged queries, instead of rebuilding from scratch.
+5. ~~Incremental SVD (Brand's update)~~ (implemented in `linalg.brand_update_rows`; not used for faq-live because a rebuild also changes the vocabulary and IDF, see REPORT.md).
 6. Batch lookups with one matrix-matrix product, $S = Q C^{\top}$, and a throughput benchmark.
-7. LSH parameter sweeps over $b$ and $L$, multi-probe LSH, and a comparison against FAISS.
+7. ~~LSH parameter sweeps over $b$ and $L$~~ (done: `measure --only lsh`); next: multi-probe LSH, FAISS.
 8. Move entries to SQLite or Redis so several API workers share one cache.
 
 **Make it a product**
 
-9. Time-to-live for time-sensitive questions (weather, prices).
+9. ~~Time-to-live~~ (done: `cache.ttl_seconds`, per entry when added by hand).
 10. Hindi-English queries: align two embedding spaces with orthogonal Procrustes, whose rotation also comes from an SVD.
 11. Docker Compose with the API and Ollama.

@@ -36,6 +36,29 @@ STOPWORDS = frozenset(
 """Common function words. Negations, question words and on/off/up/down are deliberately
 absent: "turn on" and "turn off" must not look identical."""
 
+EVERYDAY_WORDS = frozenset(
+    """
+    what how why when where which who whom whose whether
+    go goes going went gone get gets getting got gotten make makes making made take takes taking took taken
+    give gives giving gave given come comes coming came put puts putting keep keeps keeping kept let lets
+    know knows knowing knew known think thinks thinking thought want wants wanting wanted need needs needing
+    needed use uses using used try tries trying tried see sees seeing saw seen look looks looking looked
+    find finds finding found tell tells telling told say says saying said ask asks asking asked
+    show shows showing showed shown mean means meaning meant happen happens happening happened
+    seem seems seemed become becomes becoming became
+    really actually just still even ever always often sometimes usually now today then already yet soon
+    later again also too quite rather maybe perhaps probably anyway
+    one ones thing things stuff something anything everything nothing someone anyone everyone nobody
+    somebody anybody somewhere anywhere everywhere way ways kind kinds sort sorts lot lots bit
+    please thanks thank hello hi hey dear okay ok yes yeah etc
+    """.split()
+)
+"""Everyday words that say nothing about a question's topic: question words, light verbs
+(go, get, make, find ...), indefinites (one, thing, someone ...), adverbs and greetings.
+Adjectives are deliberately absent ("new password", "cheap flights" carry meaning). Used
+only by the known-word guard's topic-word rule (embedder.KnownWordPolicy): an unknown
+everyday word doesn't count against a question. They stay ordinary terms everywhere else."""
+
 _CONTRACTIONS = [
     (re.compile(r"\bwon't\b"), "will not"),
     (re.compile(r"\bcan't\b"), "can not"),
